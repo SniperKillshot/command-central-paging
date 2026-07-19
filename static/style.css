@@ -1,0 +1,144 @@
+/* Command Central Paging - Dashboard Styles */
+
+:root {
+    --primary: #2196F3;
+    --danger: #f44336;
+    --warning: #ff9800;
+    --success: #4CAF50;
+    --bg-dark: #1a1a1a;
+    --bg-card: #2d2d2d;
+    --text: #ffffff;
+    --text-muted: #b0b0b0;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+html, body {
+    height: 100%;
+}
+
+body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background: var(--bg-dark);
+    color: var(--text);
+    line-height: 1.6;
+    /* touchscreen kiosk: no accidental text selection/scrolling */
+    -webkit-user-select: none;
+    user-select: none;
+    overflow: hidden;
+}
+
+/* Alert banner - color scheme matches Forewarned's own alert-banner-* classes
+   so the two dashboards read as one system. */
+.alert-banner {
+    padding: 24px 32px;
+    text-align: center;
+    border-bottom: 2px solid #1a1a1a;
+    transition: background 0.3s ease;
+}
+
+.alert-banner-level {
+    font-size: 2.5rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+}
+
+.alert-banner-reason {
+    font-size: 1.1rem;
+    margin-top: 8px;
+    opacity: 0.9;
+}
+
+.alert-banner-none {
+    background: var(--bg-card);
+    color: var(--text-muted);
+}
+
+.alert-banner-advisory {
+    background: #1976d2;
+    color: #fff;
+    border-bottom: 2px solid #1565c0;
+}
+
+.alert-banner-watch {
+    background: #ffd54f;
+    color: #000;
+    border-bottom: 2px solid #ffc107;
+}
+
+.alert-banner-warning {
+    background: #ff9800;
+    color: #fff;
+    border-bottom: 2px solid #f57c00;
+}
+
+.alert-banner-emergency {
+    background: #f44336;
+    color: #fff;
+    border-bottom: 2px solid #d32f2f;
+    animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.85; }
+}
+
+.reachability-banner {
+    background: #d32f2f;
+    color: #fff;
+    text-align: center;
+    padding: 8px;
+    font-weight: 600;
+}
+
+.hidden {
+    display: none;
+}
+
+.container {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    padding: 24px;
+}
+
+.panel {
+    background: var(--bg-card);
+    border-radius: 8px;
+    padding: 20px;
+    min-height: 200px;
+}
+
+.panel h2 {
+    margin-bottom: 12px;
+    font-size: 1.3rem;
+}
+
+.panel-note {
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+footer {
+    position: fixed;
+    bottom: 0;
+    width: 100%;
+    text-align: center;
+    padding: 8px;
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    background: var(--bg-card);
+}
+
+/* Touchscreen: everything below should use large, thumb-friendly targets once
+   the override/paging panels are wired up in later phases. */
+button {
+    min-height: 56px;
+    min-width: 56px;
+    font-size: 1.1rem;
+}

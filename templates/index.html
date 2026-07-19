@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Command Central Paging</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div id="alert-banner" class="alert-banner alert-banner-none">
+        <div class="alert-banner-level" id="alert-level">NONE</div>
+        <div class="alert-banner-reason" id="alert-reason">No active alerts</div>
+    </div>
+
+    <div id="reachability-banner" class="reachability-banner hidden">
+        Forewarned unreachable - last known state shown may be stale
+    </div>
+
+    <main class="container">
+        <section class="panel">
+            <h2>Manual Override</h2>
+            <p class="panel-note">Not yet wired up - Phase 2</p>
+        </section>
+
+        <section class="panel">
+            <h2>Paging</h2>
+            <p class="panel-note">Not yet wired up - Phase 3</p>
+        </section>
+    </main>
+
+    <footer id="last-updated">Last updated: never</footer>
+
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>

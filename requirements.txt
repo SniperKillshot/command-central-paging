@@ -1,0 +1,7 @@
+# Phase 1 (skeleton + Forewarned polling)
+flask
+requests
+pyyaml
+
+# Phase 3 (CME SIP paging) will add pjsua2 - not pip-installable, comes from
+# the Docker image's Alpine edge py3-pjsua package, same as Forewarned.

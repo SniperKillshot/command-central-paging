@@ -1,0 +1,42 @@
+# Command Central Paging configuration.
+# Copy this file to config.yaml and fill in real values. config.yaml is
+# gitignored - secrets can also be supplied via environment variables
+# instead (see src/config.py's ENV_OVERRIDES), e.g. for Docker deployments.
+
+forewarned:
+  base_url: "http://forewarned.local:5000"
+  poll_interval: 5   # seconds
+
+home_assistant:
+  base_url: "http://homeassistant.local:8123"
+  token: ""          # long-lived access token (Settings > Profile > Security)
+                      # env override: HA_TOKEN
+  entities:
+    advisory: input_boolean.forewarned_manual_advisory
+    watch: input_boolean.forewarned_manual_watch
+    warning: input_boolean.forewarned_manual_warning
+    emergency: input_boolean.forewarned_manual_emergency
+
+# Not used until Phase 3 (CME SIP paging).
+cme:
+  sip_server: ""
+  sip_domain: ""
+  sip_port: 5060
+  transport: "udp"
+  sip_user: ""
+  sip_password: ""   # env override: CME_SIP_PASSWORD
+  tts_voice: "en-us"
+  tts_speed: 160
+
+# Not used until Phase 3. "mock" backend lets the paging UI/API be exercised
+# with zero CME dependency - swap to "cme" once a SIP trunk/paging-dn is
+# provisioned, no code changes needed.
+paging_destinations:
+  - id: "site-wide"
+    name: "All Call"
+    backend: "mock"
+    extension: "8500"
+
+web:
+  host: "0.0.0.0"
+  port: 5000

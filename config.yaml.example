@@ -1,11 +1,15 @@
 # Command Central Paging configuration.
 # Copy this file to config.yaml and fill in real values. config.yaml is
 # gitignored - secrets can also be supplied via environment variables
-# instead (see src/config.py's ENV_OVERRIDES), e.g. for Docker deployments.
+# instead (see src/config.py's ENV_OVERRIDES).
 
 forewarned:
   base_url: "http://forewarned.local:5000"
   poll_interval: 5   # seconds
+  # Shared secret Forewarned must send (X-Forewarned-Token header) when it
+  # pushes status to POST /api/forewarned/push. Blank = accept unauthenticated.
+  # env override: FOREWARNED_PUSH_TOKEN
+  push_token: ""
 
 home_assistant:
   base_url: "http://homeassistant.local:8123"
@@ -28,15 +32,162 @@ cme:
   tts_voice: "en-us"
   tts_speed: 160
 
-# Not used until Phase 3. "mock" backend lets the paging UI/API be exercised
-# with zero CME dependency - swap to "cme" once a SIP trunk/paging-dn is
-# provisioned, no code changes needed.
+# Connection to a DVMProject FNE (dvmfne, https://github.com/DVMProject/dvmhost).
+# Command Central Paging logs in as an ordinary network peer, like a dvmhost
+# repeater or dvmbridge. On the FNE side:
+#   - if the FNE uses a peer ACL (peer_list.dat), add this peer_id with its
+#     password there; otherwise use the FNE's master password
+#   - the peer_id must be unique on the FNE (a duplicate gets refused)
+# Status shows in the dashboard's "DVM FNE" panel.
+dvm:
+  enabled: false
+  address: "fne.local"     # FNE host/IP   env override: DVM_FNE_ADDRESS
+  port: 62031              # FNE master port (the FNE's network.port)
+  peer_id: 9000001         # this service's peer ID, 1 - 999999999
+  password: ""             # env override: DVM_FNE_PASSWORD
+  # Only if the FNE has encrypted: true - same 64-hex-char presharedKey.
+  # Needs the 'cryptography' package. env override: DVM_FNE_PRESHARED_KEY
+  preshared_key: ""
+  identity: "CCPAGING"     # name shown in the FNE's peer list
+  location: ""
+  conventional_peer: false
+  ping_interval: 10        # seconds between keepalive pings (dvmhost uses 10)
+  retry_interval: 10       # seconds between login retries / reconnects
+  timeout: 60              # seconds of silence from the FNE before reconnecting
+
+# Where pages can go. Each destination names a backend:
+#   mock - logs the page only; exercises the whole pipeline with no hardware
+#   p25  - P25 voice page to a talkgroup over the DVM FNE connection above:
+#          the message is spoken with the TTS voice (after an optional alert
+#          sound) and sent as a P25 group call. A destination may set its own
+#          voice:  voice: {engine: sapi, voice: "Microsoft Zira Desktop", rate: 110}
+# Phase 3 adds "cme" (Cisco CME paging-dn over SIP).
 paging_destinations:
   - id: "site-wide"
     name: "All Call"
     backend: "mock"
     extension: "8500"
+  - id: "p25-ops"
+    name: "P25 Ops Talkgroup"
+    backend: "p25"
+    talkgroup: "1001"
+
+# P25 voice calls.
+p25:
+  source_id: 0               # radio ID pages are sent from (REQUIRED). If the FNE
+                             # enforces a radio ID list, add this ID there.
+  sys_id: "001"              # P25 system ID, hex (dvmhost sysId)
+  net_id: "BB800"            # P25 WACN, hex (dvmhost netId)
+  priority: 4
+  lead_in_ms: 400            # silence before the audio, so radios unmute in time
+  sound_gap_ms: 400          # between the alert sound and the speech
+  tail_ms: 300
+  voice_gain_db: 0
+  sound_gain_db: 0
+  max_call_seconds: 120
+  # Refuse to page a talkgroup the FNE says isn't active for this peer
+  # (only checked once the FNE has sent its talkgroup list).
+  require_active_talkgroup: true
+
+# Text-to-speech. Engines are used if installed:
+#   sapi      Windows built-in voices (Windows only)
+#   cepstral  Cepstral Swift - "swift" on PATH, or set swift_path
+#   espeak    eSpeak NG - apt install espeak-ng
+#   piper     Piper neural TTS - pip install piper-tts, then put voice models
+#             (*.onnx + *.onnx.json, from huggingface.co/rhasspy/piper-voices)
+#             in piper_voices_dir
+# The default voice below is used until one is picked on the dashboard (the
+# dashboard choice is saved in data_dir/settings.json and wins from then on).
+tts:
+  default:
+    engine: ""               # blank = first installed engine
+    voice: ""                # engine's voice id (see the dashboard's Voice panel)
+    rate: 100                # speaking speed, percent
+  swift_path: ""
+  espeak_path: ""
+  piper_path: ""
+  piper_voices_dir: "voices"
+
+# Alert sounds. Built in: alert_tone, hi_lo, warble, pulsed, triple_beep,
+# wail, chime, noaa_wat (NOAA 1050 Hz, 10 s), eas_attention (EAS 853+960 Hz,
+# 8 s). Any WAV file put in this folder becomes a sound named after
+# the file (letters, digits, _ and - only); a file named like a built-in
+# replaces it.
+sounds_dir: "sounds"
+
+# Dispatch console (http://<host>:5000/dispatch): a tile per talkgroup showing
+# who is talking on it, with hold-to-talk, alert tones and spoken pages.
+# Tiles are the talkgroups listed here (in this order), then any p25 paging
+# destination not listed, then (show_fne_talkgroups) anything else the FNE
+# reports active. color: blue, green, amber, red, purple, teal or grey.
+# Tiles can also be set up on the console itself ("Edit tiles"); that is
+# saved in data_dir/settings.json and replaces this section until reset.
+dispatch:
+  talkgroups:
+    - {id: 1001, name: "Ops", color: blue}
+    # - {id: 2002, name: "Fire Ground", color: red}
+  show_fne_talkgroups: true
+  # Alert sounds offered as buttons, in order. Empty = every sound.
+  tones: [alert_tone, hi_lo, pulsed, triple_beep, wail, chime, noaa_wat, eas_attention]
+
+# Where runtime settings (the chosen voice) are saved.
+data_dir: "data"
+
+# What gets paged automatically when Forewarned's state changes.
+#
+# Events (the "events" field - a single name or a list):
+#   level_changed          - Forewarned's overall alert level changed
+#   weather_alert_issued   - a new BOM warning appeared
+#   weather_alert_updated  - an existing warning was reissued with new details
+#   weather_alert_cleared  - a warning was cancelled or expired
+#   eoc_state_changed      - LDMG status changed (stand up, lean forward...)
+#
+# Match conditions (all must hold; omit "match" to fire on every event):
+#   min_level: warning                    level at least this
+#   <field>_contains: ["a", "b"]          field contains any (case-insensitive)
+#   <field>: ["a", "b"]                   field equals any (case-insensitive)
+#
+# Message placeholders - warning events: {event} {event_short} {headline}
+#   {areas} {severity} {urgency} {onset} {expires} {description} {level}
+# level_changed: {level} {level_upper} {previous_level} {direction} {reason}
+# eoc_state_changed: {state} {state_upper} {previous_state} {site} {level}
+# Omit "message" to use a sensible default for the event type. Note
+# {description} can be very long - avoid it for voice pages.
+#
+# Note: Forewarned only gets a real severity from BOM's CAP feed; plain BOM
+# XML warnings always report "Moderate", so match on event names rather than
+# severity where possible.
+alert_routing:
+  # false: on startup, warnings already active are treated as already paged.
+  page_existing_on_startup: false
+  rules:
+    - name: "Severe thunderstorm to P25"
+      events: [weather_alert_issued, weather_alert_updated]
+      match:
+        event_contains: ["severe thunderstorm"]
+      destinations: ["p25-ops"]
+      sound: "hi_lo"         # optional alert sound played before the message
+      message: "Attention all units. {headline}. Areas affected: {areas}."
+
+    - name: "Escalation to warning or above"
+      events: level_changed
+      match:
+        min_level: warning
+        direction: escalation
+      destinations: ["site-wide"]
+      message: "Alert level raised to {level_upper}. {reason}."
+
+    - name: "All clear"
+      enabled: false
+      events: level_changed
+      match:
+        level: none
+      destinations: ["site-wide"]
+      message: "All clear. Forewarned alert level has returned to normal."
 
 web:
   host: "0.0.0.0"
   port: 5000
+  # If set, sending pages and changing the voice need this token (header
+  # X-Api-Token; the dashboard asks for it once). env override: WEB_API_TOKEN
+  api_token: ""

@@ -2,7 +2,7 @@
 import logging
 import time
 from threading import Thread
-from typing import Optional
+from typing import Any, Callable, Dict, Optional
 
 import requests
 
@@ -17,16 +17,24 @@ class ForewarnedClient:
     rather than silently clearing the alert - an unreachable Forewarned should
     never read as "all clear" on an alerting console."""
 
-    def __init__(self, base_url: str, poll_interval: int = 5):
+    def __init__(self, base_url: str, poll_interval: int = 5,
+                 on_status: Optional[Callable[[Dict[str, Any]], None]] = None):
         self.base_url = base_url.rstrip('/')
         self.poll_interval = poll_interval
+        self.on_status = on_status
         self._stop = False
 
     def poll_once(self) -> bool:
         try:
             response = requests.get(f"{self.base_url}/api/status", timeout=5)
             if response.status_code == 200:
-                update_forewarned_state(reachable=True, status=response.json())
+                status = response.json()
+                update_forewarned_state(reachable=True, status=status)
+                if self.on_status:
+                    try:
+                        self.on_status(status)
+                    except Exception:
+                        logger.exception("Error handling Forewarned status")
                 return True
             logger.warning(f"Forewarned returned status {response.status_code}")
             update_forewarned_state(reachable=False)

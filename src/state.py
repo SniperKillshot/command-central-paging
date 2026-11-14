@@ -26,7 +26,16 @@ app_state: Dict[str, Any] = {
         'destinations': [],
         'last_result': None,
     },
+    # DVM FNE peer connection (see src/dvm/peer.py for the full field list).
+    'dvm': {
+        'enabled': False,
+    },
+    # Most recent first, capped at HISTORY_LIMIT.
+    'events': [],
+    'dispatches': [],
 }
+
+HISTORY_LIMIT = 50
 
 
 def update_forewarned_state(*, reachable: bool, status: Optional[Dict[str, Any]] = None) -> None:
@@ -59,6 +68,24 @@ def update_paging_result(result: Dict[str, Any]) -> None:
         app_state['paging']['last_result'] = result
 
 
+def record_events(events: list) -> None:
+    if not events:
+        return
+    with _lock:
+        app_state['events'] = ([e.to_dict() for e in reversed(events)] + app_state['events'])[:HISTORY_LIMIT]
+
+
+def record_dispatch(entry: Dict[str, Any]) -> None:
+    with _lock:
+        app_state['dispatches'] = ([entry] + app_state['dispatches'])[:HISTORY_LIMIT]
+        app_state['paging']['last_result'] = entry
+
+
+def update_dvm_state(status: Dict[str, Any]) -> None:
+    with _lock:
+        app_state['dvm'] = status
+
+
 def snapshot() -> Dict[str, Any]:
     """Return a shallow-copied snapshot of app_state safe to serialize."""
     with _lock:
@@ -66,4 +93,7 @@ def snapshot() -> Dict[str, Any]:
             'forewarned': dict(app_state['forewarned']),
             'manual_override': dict(app_state['manual_override']),
             'paging': dict(app_state['paging']),
+            'dvm': dict(app_state['dvm']),
+            'events': list(app_state['events']),
+            'dispatches': list(app_state['dispatches']),
         }

@@ -29,7 +29,7 @@ body {
     /* touchscreen kiosk: no accidental text selection/scrolling */
     -webkit-user-select: none;
     user-select: none;
-    overflow: hidden;
+    overflow-x: hidden;
 }
 
 /* Alert banner - color scheme matches Forewarned's own alert-banner-* classes
@@ -104,7 +104,7 @@ body {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 20px;
-    padding: 24px;
+    padding: 24px 24px 56px; /* bottom: clear the fixed footer */
 }
 
 .panel {
@@ -141,4 +141,184 @@ button {
     min-height: 56px;
     min-width: 56px;
     font-size: 1.1rem;
+}
+
+/* Recent pages log */
+.panel-wide {
+    grid-column: 1 / -1;
+}
+
+
+.dispatch-list {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.dispatch-empty {
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+.dispatch {
+    border-left: 6px solid var(--text-muted);
+    background: var(--bg-dark);
+    border-radius: 4px;
+    padding: 10px 14px;
+}
+
+.dispatch-ok { border-left-color: var(--success); }
+.dispatch-stub { border-left-color: var(--warning); }
+.dispatch-failed { border-left-color: var(--danger); }
+
+.dispatch-head {
+    font-weight: 600;
+}
+
+.dispatch-message {
+    margin: 4px 0;
+}
+
+.dispatch-meta {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+}
+
+/* DVM FNE connection */
+.dvm-status {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 1.15rem;
+    font-weight: 600;
+    margin-bottom: 10px;
+}
+
+.dvm-dot {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--text-muted);
+}
+
+.dvm-up .dvm-dot { background: var(--success); }
+.dvm-pending .dvm-dot { background: var(--warning); }
+.dvm-down .dvm-dot { background: var(--danger); }
+.dvm-off { color: var(--text-muted); }
+
+.dvm-details {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 4px 14px;
+    font-size: 0.95rem;
+}
+
+.dvm-details.hidden {
+    display: none;
+}
+
+.dvm-details dt {
+    color: var(--text-muted);
+}
+
+.dvm-details dd {
+    overflow-wrap: anywhere;
+}
+
+/* Paging and voice forms */
+.form-row {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-bottom: 12px;
+}
+
+.form-row label {
+    color: var(--text-muted);
+    font-size: 0.9rem;
+}
+
+select, textarea, input[type="text"] {
+    background: var(--bg-dark);
+    color: var(--text);
+    border: 1px solid #555;
+    border-radius: 6px;
+    padding: 10px;
+    font-size: 1rem;
+    font-family: inherit;
+    min-height: 48px;
+    -webkit-user-select: text;
+    user-select: text;
+}
+
+textarea {
+    resize: vertical;
+}
+
+input[type="range"] {
+    width: 100%;
+    min-height: 40px;
+    accent-color: var(--primary);
+}
+
+.button-row {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.button-row button {
+    flex: 1 1 140px;
+}
+
+.btn-primary, .btn-secondary, .sound-btn {
+    border: none;
+    border-radius: 6px;
+    color: var(--text);
+    cursor: pointer;
+    padding: 0 16px;
+}
+
+.btn-primary { background: var(--danger); font-weight: 600; }
+.btn-secondary { background: #444; }
+.btn-primary:active, .btn-secondary:active, .sound-btn:active { filter: brightness(1.3); }
+
+.sound-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.sound-btn {
+    background: #3a3a3a;
+    min-height: 48px;
+    font-size: 0.95rem;
+    border: 2px solid transparent;
+}
+
+.sound-btn.selected {
+    border-color: var(--warning);
+    background: #4a3a1a;
+}
+
+.form-status {
+    min-height: 1.4em;
+    margin-top: 10px;
+    color: var(--text-muted);
+    font-size: 0.9rem;
+}
+
+.form-status.ok { color: var(--success); }
+.form-status.error { color: var(--danger); }
+
+.console-link {
+    float: right;
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--primary);
+    text-decoration: none;
+    padding: 6px 12px;
+    border: 1px solid var(--primary);
+    border-radius: 6px;
 }

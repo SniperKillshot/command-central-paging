@@ -4,3 +4,8 @@ __pycache__/
 config.yaml
 *.log
 .vscode/
+data/
+voices/
+
+# compiled IMBE encoder (python tools/build_native.py)
+src/p25/native/_imbe.*

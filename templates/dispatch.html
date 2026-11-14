@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="mobile-web-app-capable" content="yes">
+    <title>Dispatch Console</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='dispatch.css') }}">
+</head>
+<body>
+    <header class="topbar">
+        <a class="top-link" href="/" title="Back to the dashboard">&#8592; Dashboard</a>
+        <h1>Dispatch</h1>
+        <div class="listen-box">
+            <button id="listen" class="listen-btn" aria-pressed="false" title="Hear calls on the monitored talkgroups">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4z"/><path class="waves" d="M16 8.5a5 5 0 0 1 0 7M18.5 6a8.5 8.5 0 0 1 0 12"/></svg>
+                <span id="listen-text">Listen</span>
+            </button>
+            <input id="volume" type="range" min="0" max="150" value="100" aria-label="Listen volume">
+        </div>
+        <div id="fne" class="pill pill-off"><span class="dot"></span><span id="fne-text">FNE</span></div>
+        <div id="alert" class="pill alert-none">Alert: NONE</div>
+        <button id="edit-open" class="top-link edit-open" title="Add, remove, rename and reorder tiles">Edit tiles</button>
+        <div id="clock" class="clock">--:--:--</div>
+    </header>
+
+    <div id="fne-banner" class="fne-banner hidden"></div>
+
+    <main class="console">
+        <section class="tiles-area" aria-label="Talkgroups">
+            <div id="tiles" class="tiles">
+                <p class="tiles-empty">Loading talkgroups...</p>
+            </div>
+        </section>
+
+        <aside class="controls" aria-label="Transmit controls">
+            <div class="selection">
+                <div class="selection-head">
+                    <span class="label">Selected</span>
+                    <button id="select-all" class="mini-btn">All</button>
+                    <button id="select-clear" class="mini-btn">Clear</button>
+                </div>
+                <div id="selected" class="selected-list">None - tap a talkgroup</div>
+            </div>
+
+            <button id="ptt" class="ptt" disabled>
+                <span id="ptt-label" class="ptt-label">HOLD TO TALK</span>
+                <span id="ptt-sub" class="ptt-sub">Select a talkgroup first</span>
+                <span class="ptt-meter"><span id="ptt-level"></span></span>
+            </button>
+
+            <div class="lead-row">
+                <label for="lead-tone">Alert first</label>
+                <select id="lead-tone"><option value="">No tone</option></select>
+            </div>
+
+            <div class="group">
+                <div class="label">Alert tones <span class="hint">send now</span></div>
+                <div id="tones" class="tones"></div>
+            </div>
+
+            <div class="group">
+                <label class="label" for="message">Spoken message</label>
+                <div class="message-row">
+                    <textarea id="message" rows="2" maxlength="1000" placeholder="Type a message to read out"></textarea>
+                    <button id="speak" class="speak-btn" disabled>Send</button>
+                </div>
+            </div>
+
+            <p id="status" class="status" role="status" aria-live="polite"></p>
+            <p class="keys">Keys: <kbd>1</kbd>-<kbd>0</kbd> select &middot; hold <kbd>Space</kbd> to talk &middot; <kbd>Esc</kbd> clear &middot; <kbd>L</kbd> listen on/off</p>
+        </aside>
+    </main>
+
+    <footer class="activity-area" aria-label="Recent activity">
+        <ul id="activity" class="activity"></ul>
+    </footer>
+
+    <div id="editor" class="editor hidden" role="dialog" aria-modal="true" aria-labelledby="editor-title">
+        <div class="editor-panel">
+            <div class="editor-head">
+                <h2 id="editor-title">Edit tiles</h2>
+                <button id="editor-cancel" class="mini-btn">Cancel</button>
+                <button id="editor-save" class="speak-btn editor-save">Save</button>
+            </div>
+            <p id="editor-status" class="status editor-status"></p>
+            <div class="editor-body">
+                <ol id="editor-rows" class="editor-rows"></ol>
+                <div class="editor-add">
+                    <button id="editor-add" class="mini-btn">+ Add tile</button>
+                    <div id="editor-fne-box" class="editor-fne hidden">
+                        <span class="label">Active on the FNE, not on a tile:</span>
+                        <div id="editor-fne" class="chips"></div>
+                    </div>
+                </div>
+                <label class="switch-row">
+                    <input id="editor-show-fne" type="checkbox">
+                    <span>Also show any other talkgroup the FNE reports active</span>
+                </label>
+                <div class="group">
+                    <span class="label">Alert tone buttons</span>
+                    <div id="editor-tones" class="chips"></div>
+                </div>
+                <div class="editor-foot">
+                    <span id="editor-source" class="hint"></span>
+                    <button id="editor-reset" class="mini-btn">Reset to config.yaml</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='dispatch.js') }}"></script>
+</body>
+</html>

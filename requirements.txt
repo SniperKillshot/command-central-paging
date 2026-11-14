@@ -2,6 +2,11 @@
 flask
 requests
 pyyaml
+numpy
 
-# Phase 3 (CME SIP paging) will add pjsua2 - not pip-installable, comes from
-# the Docker image's Alpine edge py3-pjsua package, same as Forewarned.
+# DVM FNE connection: only needed if the FNE uses a pre-shared key
+# (encrypted: true). Leave it out otherwise.
+cryptography
+
+# Phase 3 (CME SIP paging) will add pjsua2 - not pip-installable, so it will
+# need a system package or a source build on the host machine.

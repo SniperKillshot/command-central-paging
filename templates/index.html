@@ -23,8 +23,74 @@
         </section>
 
         <section class="panel">
-            <h2>Paging</h2>
-            <p class="panel-note">Not yet wired up - Phase 3</p>
+            <h2>Paging <a class="console-link" href="/dispatch">Open dispatch console &#8594;</a></h2>
+            <div class="form-row">
+                <label for="page-dest">Send to</label>
+                <select id="page-dest"></select>
+            </div>
+            <div class="form-row">
+                <label>Alert sound</label>
+                <div id="sound-buttons" class="sound-buttons"></div>
+            </div>
+            <div class="form-row">
+                <label for="page-message">Message</label>
+                <textarea id="page-message" rows="3" maxlength="1000"
+                          placeholder="Text to speak (optional if a sound is selected)"></textarea>
+            </div>
+            <div class="button-row">
+                <button id="page-preview" class="btn-secondary">Preview</button>
+                <button id="page-send" class="btn-primary">Send page</button>
+            </div>
+            <p id="page-status" class="form-status"></p>
+        </section>
+
+        <section class="panel">
+            <h2>Voice</h2>
+            <div class="form-row">
+                <label for="tts-engine">Engine</label>
+                <select id="tts-engine"></select>
+            </div>
+            <div class="form-row">
+                <label for="tts-voice">Voice</label>
+                <select id="tts-voice"></select>
+            </div>
+            <div class="form-row">
+                <label for="tts-rate">Speed <span id="tts-rate-value">100%</span></label>
+                <input id="tts-rate" type="range" min="50" max="200" step="5" value="100">
+            </div>
+            <div class="form-row">
+                <label for="tts-sample">Test phrase</label>
+                <input id="tts-sample" type="text" maxlength="300"
+                       value="Attention all units. This is a test of the paging system.">
+            </div>
+            <div class="button-row">
+                <button id="tts-preview" class="btn-secondary">Hear it on radio</button>
+                <button id="tts-save" class="btn-primary">Use this voice</button>
+            </div>
+            <p id="tts-status" class="form-status"></p>
+        </section>
+
+        <section class="panel">
+            <h2>DVM FNE</h2>
+            <div id="dvm-status" class="dvm-status dvm-off">
+                <span class="dvm-dot"></span>
+                <span id="dvm-state">Not enabled</span>
+            </div>
+            <dl id="dvm-details" class="dvm-details hidden">
+                <dt>FNE</dt><dd id="dvm-master"></dd>
+                <dt>This peer</dt><dd id="dvm-peer"></dd>
+                <dt>Ping</dt><dd id="dvm-ping"></dd>
+                <dt>Talkgroups</dt><dd id="dvm-tgs"></dd>
+                <dt>Last call heard</dt><dd id="dvm-call"></dd>
+                <dt>Last error</dt><dd id="dvm-error"></dd>
+            </dl>
+        </section>
+
+        <section class="panel panel-wide">
+            <h2>Recent Pages</h2>
+            <ul id="dispatch-list" class="dispatch-list">
+                <li class="dispatch-empty">No pages sent yet</li>
+            </ul>
         </section>
     </main>
 

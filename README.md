@@ -376,13 +376,14 @@ tty1::respawn:/bin/login -f kiosk
 ```sh
 xset s off -dpms s noblank          # never blank the screen
 unclutter --timeout 1 &             # hide the pointer (it's a touchscreen)
-# wait for the paging service to be up
-until wget -q -O /dev/null http://localhost:5000/health; do sleep 2; done
+# wait for the paging service to be up (127.0.0.1, not localhost: that is
+# ::1 first on Alpine, and the service listens on IPv4)
+until wget -q -O /dev/null http://127.0.0.1:5000/health; do sleep 2; done
 exec chromium-browser --kiosk --noerrdialogs --disable-infobars --no-first-run \
     --autoplay-policy=no-user-gesture-required \
     --disable-pinch --overscroll-history-navigation=0 \
     --check-for-update-interval=31536000 \
-    'http://localhost:5000/dispatch?talk=off&listen=on'
+    'http://127.0.0.1:5000/dispatch?talk=off&listen=on'
 ```
 
 Then `reboot`. The paging service has to start at boot as well (see
@@ -394,9 +395,23 @@ Then `reboot`. The paging service has to start at boot as well (see
   first time a tone or message is sent, and the browser remembers it.
 - **Spoken messages:** these need text typed in, so plug in a keyboard. Alert
   tones and listening need only touch.
-- **Touch lands in the wrong place:** if the screen is rotated or scaled, set
-  the touchscreen's `Coordinate Transformation Matrix` with `xinput` in
-  `.xinitrc`.
+- **Touch lands in the wrong place:** read the raw touch position (0-4095)
+  at the four corners of the picture, then give libinput a calibration
+  matrix in `/etc/X11/xorg.conf.d/99-touch-calibration.conf`. With the
+  corners at raw x `L`..`R` and y `T`..`B`, `a = 4095/(R-L)`,
+  `c = -L/(R-L)`, `e = 4095/(B-T)`, `f = -T/(B-T)`:
+
+  ```
+  Section "InputClass"
+      Identifier "touchscreen calibration"
+      MatchIsPointer "on"
+      Driver "libinput"
+      Option "CalibrationMatrix" "a 0 c 0 e f 0 0 1"
+  EndSection
+  ```
+
+  (The CSC-1's NCR 5965 needed `1.6097 0 -0.3211 0 1.5783 -0.3022 0 0 1`.)
+  Restart X with `doas pkill -u kiosk`.
 - **No sound:** check `aplay -l` lists the output and that it is unmuted in
   `alsamixer`. When PulseAudio isn't running, Chromium falls back to ALSA.
 

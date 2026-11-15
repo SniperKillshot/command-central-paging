@@ -48,6 +48,7 @@ button { cursor: pointer; touch-action: manipulation; }
 button:disabled { cursor: not-allowed; }
 :focus-visible { outline: 3px solid #90caf9; outline-offset: 2px; }
 .hidden { display: none !important; }
+.no-talk .talk-only { display: none; }
 
 /* -- top bar ---------------------------------------------------------------- */
 

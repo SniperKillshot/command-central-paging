@@ -1,6 +1,11 @@
 // Dispatch console: talkgroup tiles, listening, live talk, alert tones and
 // spoken pages. Works by touch, mouse or keyboard (1-0 select tiles, hold
 // Space to talk, Esc clears the selection, L toggles listening).
+//
+// URL options, for a screen with a fixed job (e.g. the host's touchscreen):
+//   ?talk=off    listen-only: no talk button, Space does nothing, no mic
+//   ?listen=on   start listening when the page loads (a kiosk browser
+//                needs --autoplay-policy=no-user-gesture-required for this)
 
 const POLL_MS = 1000;
 const SEND_EVERY_MS = 100;        // live talk: how often mic audio is posted
@@ -13,6 +18,10 @@ const tileEls = new Map();        // tgid -> element
 let tileOrder = '';
 
 const $ = id => document.getElementById(id);
+
+const params = new URLSearchParams(location.search);
+const TALK = !/^(0|off|no|false)$/i.test(params.get('talk') || '');
+const AUTO_LISTEN = /^(1|on|yes|true)$/i.test(params.get('listen') || '');
 
 function store(key, value) {
     try {
@@ -384,16 +393,20 @@ function renderListen(text) {
     $('listen-text').textContent = text || (rxAudio.on ? 'Listening' : 'Listen');
 }
 
-async function startListening() {
-    if (rxAudio.on) return;
-    rxAudio.on = true;
-    store('ccpListen', true);
+function audioContext() {
     if (!rxAudio.ctx) {
         rxAudio.ctx = new (window.AudioContext || window.webkitAudioContext)();
         rxAudio.gain = rxAudio.ctx.createGain();
         rxAudio.gain.connect(rxAudio.ctx.destination);
     }
-    await rxAudio.ctx.resume();
+    return rxAudio.ctx;
+}
+
+async function startListening() {
+    if (rxAudio.on) return;
+    rxAudio.on = true;
+    store('ccpListen', true);
+    await audioContext().resume();
     setVolume();
     renderListen();
     listenLoop();
@@ -558,6 +571,7 @@ function setPtt(label, sub, cls = '') {
 }
 
 function setPttIdle() {
+    if (!TALK) return;
     const b = $('ptt');
     $('ptt-level').style.width = '0';
     if (!micSupported()) {
@@ -612,7 +626,7 @@ function showTalkState() {
 }
 
 async function pttDown() {
-    if (talk.held || talk.session || !selected.size || $('ptt').disabled) return;
+    if (!TALK || talk.held || talk.session || !selected.size || $('ptt').disabled) return;
     talk.held = true;
     let mic;
     try {
@@ -739,7 +753,7 @@ function setupKeys() {
         if (editorOpen() || typing(e) || e.ctrlKey || e.altKey || e.metaKey) return;
         if (e.code === 'Space') {
             e.preventDefault();             // no page scroll / button click
-            if (!e.repeat) pttDown();
+            if (!e.repeat && TALK) pttDown();
         } else if (/^Digit[0-9]$/.test(e.code) && state) {
             const n = Number(e.code.slice(5));
             const t = state.talkgroups[n === 0 ? 9 : n - 1];
@@ -991,9 +1005,17 @@ document.addEventListener('DOMContentLoaded', () => {
     const vol = store('ccpVolume');
     if (vol != null) $('volume').value = vol;
     $('volume').addEventListener('input', () => { store('ccpVolume', Number($('volume').value)); setVolume(); });
-    // Browsers only start audio after a tap or key press: if listening was on
-    // last time, resume it on the first one.
-    if (store('ccpListen')) {
+    if (!TALK) {
+        document.body.classList.add('no-talk');
+        $('ptt').classList.add('hidden');
+    }
+    // Browsers only start audio after a tap or key press (unless told
+    // otherwise, as a kiosk can be): if listening was on last time, or
+    // ?listen=on, start it straight away when allowed, else on the first one.
+    const wantListen = AUTO_LISTEN || store('ccpListen');
+    if (wantListen && audioContext().state === 'running') {
+        refresh().then(() => { if (state && state.listen_available) startListening(); });
+    } else if (wantListen) {
         renderListen('Tap to resume');
         const resume = e => {
             if (e.code === 'KeyL' || (e.target.closest && e.target.closest('#listen'))) {    // those toggle it themselves

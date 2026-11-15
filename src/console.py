@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from src.audio import dsp
+from src.p25.crypto import ALGO_NAMES
 from src.state import snapshot
 
 logger = logging.getLogger(__name__)
@@ -46,8 +47,9 @@ def _tgid(v) -> Optional[int]:
 
 class DispatchConsole:
     def __init__(self, settings: Dict[str, Any], destinations: List[Dict[str, Any]], dispatcher=None,
-                 sounds=None, live=None, store=None, names=None):
+                 sounds=None, live=None, store=None, names=None, keys=None):
         self.config = settings or {}
+        self.keys = keys           # KeyStore: talkgroups sent encrypted
         self.names = names         # TalkgroupDirectory: talkgroup names from the FNE, if enabled
         self.store = store         # SettingsStore: tile setup saved from the browser
         self.destinations = destinations or []
@@ -175,6 +177,8 @@ class DispatchConsole:
             dest_name = self._own_name((by_tg.get(tg) or {}).get('name'), tg)
             tile['default_name'] = dest_name or self.fne_name(tg) or f'TG {tg}'
             tile['name'] = tile['custom_name'] or tile['default_name']
+            hit = self.keys.for_talkgroup(tg) if self.keys else None
+            tile['secure'] = ALGO_NAMES.get(hit[0]) if hit else None     # sent encrypted with this
         for tile in tiles.values():
             info = fne.get(tile['tgid'])
             tile['on_fne'] = info is not None

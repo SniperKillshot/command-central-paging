@@ -13,6 +13,7 @@ from src.audio import dsp
 from src.audio.tones import SoundLibrary
 from src.audio.tts import TTS, TTSError
 from src.p25 import frames as F
+from src.p25.crypto import ALGO_NAMES, CallEncryptor, KeyStore
 from src.p25.mbe_decoder import decode_to_pcm
 from src.p25.voice import TxResult, VoiceCall, encode_pcm
 
@@ -29,7 +30,8 @@ def _hex_id(v, default):
 
 
 class P25Pager:
-    def __init__(self, settings: Dict, tts: TTS, sounds: SoundLibrary, voice_settings, peer=None):
+    def __init__(self, settings: Dict, tts: TTS, sounds: SoundLibrary, voice_settings, peer=None,
+                 keys: Optional[KeyStore] = None):
         """voice_settings: callable returning the current default
         {'engine', 'voice', 'rate'} (the dashboard can change it)."""
         self.settings = settings or {}
@@ -37,6 +39,7 @@ class P25Pager:
         self.sounds = sounds
         self.voice_settings = voice_settings
         self.peer = peer
+        self.keys = keys if keys is not None else KeyStore()      # talkgroups listed with a key are sent encrypted
 
     # -- audio ---------------------------------------------------------------
 
@@ -120,6 +123,11 @@ class P25Pager:
             net_id=_hex_id(s.get('net_id'), F.WACN_STD_DEFAULT),
         )
 
+    def encryptor(self, talkgroup) -> Optional[CallEncryptor]:
+        """A fresh encryptor for a call to this talkgroup, or None to send clear."""
+        hit = self.keys.for_talkgroup(int(talkgroup))
+        return CallEncryptor(*hit) if hit else None
+
     def check_ready(self, talkgroup) -> Optional[str]:
         """Why a page to this talkgroup can't go out right now, or None."""
         if self.peer is None:
@@ -132,6 +140,10 @@ class P25Pager:
             return f"destination talkgroup '{talkgroup}' is not a number"
         if not 1 <= tg <= 0xFFFF:
             return f'talkgroup {tg} is outside the P25 range 1-65535'
+        missing = self.keys.missing_key(tg)
+        if missing:
+            return (f'talkgroup {tg} is set to encrypt with {ALGO_NAMES[missing[0]]} key 0x{missing[1]:X}, '
+                    f'but that key is missing or invalid - not sending in the clear')
         if not self.peer.connected:
             return VoiceCall(self.peer, self.call_params(tg))._not_connected()
         active = self.peer.active_talkgroup_ids()
@@ -148,6 +160,6 @@ class P25Pager:
             audio, tones = self.render_with_tones(message, sound, voice, audio)
         except (TTSError, KeyError, ValueError) as e:
             return TxResult(False, 'failed', f'could not produce audio: {e}')
-        call = VoiceCall(self.peer, self.call_params(int(talkgroup)),
+        call = VoiceCall(self.peer, self.call_params(int(talkgroup)), encryptor=self.encryptor(talkgroup),
                          max_seconds=float(self.settings.get('max_call_seconds', 120)))
         return call.transmit(dsp.to_pcm16(audio), tones)

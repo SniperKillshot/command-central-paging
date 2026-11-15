@@ -82,6 +82,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         'rest_verify_tls': True,
         'names_refresh_minutes': 10,
     },
+    'encryption': {
+        'keys': [],                  # see src/p25/crypto.py KeyStore
+    },
     'paging_destinations': [],
     'alert_routing': {
         'page_existing_on_startup': False,

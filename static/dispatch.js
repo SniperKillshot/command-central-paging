@@ -148,7 +148,8 @@ function renderTiles() {
         const el = tileEls.get(t.tgid);
         if (!el) continue;
         const rx = t.rx && t.rx.active ? t.rx : null;
-        const enc = rx && rx.stream_id && rxAudio.encrypted.has(rx.stream_id);
+        const enc = rx && rx.stream_id && rxAudio.encrypted.has(rx.stream_id);       // encrypted, no key
+        const sec = rx && rx.stream_id && rxAudio.decrypted.has(rx.stream_id);       // encrypted, decrypted here
         const tx = t.tx;           // 'queued' | 'sending' | null
         el.className = 'tile' +
             (t.color ? ` stripe-${t.color}` : '') +
@@ -159,13 +160,14 @@ function renderTiles() {
             (rxAudio.hearing(t.tgid) ? ' hearing' : '') +
             (!fneUp || (fneHasList && !t.on_fne) ? ' off' : '');
         el.querySelector('.tile-name').textContent = t.name;
-        el.querySelector('.tile-id').textContent = `TG ${t.tgid}` + (fneUp && fneHasList && !t.on_fne ? ' - not active on FNE' : '');
+        el.querySelector('.tile-id').textContent = `TG ${t.tgid}` + (t.secure ? ` · 🔒 ${t.secure}` : '') +
+            (fneUp && fneHasList && !t.on_fne ? ' - not active on FNE' : '');
 
         const badge = el.querySelector('.tile-badge');
         const detail = el.querySelector('.tile-detail');
         if (tx === 'sending') { badge.textContent = t.live ? 'LIVE' : 'TX'; detail.textContent = t.live ? 'Talking' : 'Transmitting'; }
         else if (tx === 'queued') { badge.textContent = 'QUEUED'; detail.textContent = 'Waiting for channel'; }
-        else if (rx) { badge.textContent = enc ? 'ENC' : 'RX'; detail.textContent = `${rx.src_id}  ${elapsed(rx.started)}`; }
+        else if (rx) { badge.textContent = enc ? 'ENC' : sec ? 'RX 🔒' : 'RX'; detail.textContent = `${rx.src_id}  ${elapsed(rx.started)}`; }
         else { badge.textContent = 'IDLE'; detail.textContent = ''; }
 
         const last = el.querySelector('.tile-last');
@@ -361,7 +363,8 @@ const rxAudio = {
     gain: null,
     abort: null,
     streams: new Map(),          // stream ID -> { tgid, next (ctx time) }
-    encrypted: new Set(),        // stream IDs
+    encrypted: new Set(),        // stream IDs: encrypted, no key here
+    decrypted: new Set(),        // stream IDs: encrypted on air, decrypted by the server
     muted: new Set(store('ccpMuted') || []),
     ducked: false,
 
@@ -457,9 +460,11 @@ async function readStream(reader) {
             const type = dv.getUint8(0), tgid = dv.getUint16(2, true), stream = dv.getUint32(8, true);
             if (type === 1) {
                 const pcm = new Int16Array(buf.slice(off + HDR, off + HDR + n * 2).buffer);
+                if (dv.getUint8(1) & 1) rxAudio.decrypted.add(stream);
                 playChunk(tgid, stream, pcm);
             } else if (type === 2) {
                 rxAudio.encrypted.delete(stream);
+                rxAudio.decrypted.delete(stream);
             } else if (type === 3) {
                 rxAudio.encrypted.add(stream);
             }

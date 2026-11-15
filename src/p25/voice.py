@@ -16,6 +16,7 @@ import numpy as np
 
 from src.dvm import protocol as dvm
 from src.p25 import frames as F
+from src.p25.crypto import ALGO_NAMES, CallEncryptor, build_ldu
 from src.p25.imbe import FRAME, IMBEEncoder, VocoderError, silence_frame
 
 logger = logging.getLogger(__name__)
@@ -95,9 +96,11 @@ def encode_pcm(pcm: np.ndarray, tones: Optional[np.ndarray] = None) -> List[byte
 
 class VoiceCall:
     def __init__(self, peer, params: F.CallParams, control_byte: int = 0,
-                 max_seconds: float = 120.0):
+                 max_seconds: float = 120.0, encryptor: Optional[CallEncryptor] = None):
+        """encryptor: encrypt the call with that key (None = clear)."""
         self.peer = peer
         self.params = params
+        self.encryptor = encryptor
         self.control_byte = control_byte
         self.max_seconds = max_seconds
 
@@ -146,7 +149,8 @@ class VoiceCall:
         n_ldus = total // FRAMES_PER_LDU
         t0 = time.monotonic()
         underruns = 0
-        logger.info(f"P25 call start: TG {p.dst_id} from RID {p.src_id}, {total / 50:.1f}s, stream {stream_id}")
+        secure = f', {ALGO_NAMES[self.encryptor.algo]} key 0x{self.encryptor.kid:X}' if self.encryptor else ''
+        logger.info(f"P25 call start: TG {p.dst_id} from RID {p.src_id}, {total / 50:.1f}s, stream {stream_id}{secure}")
         try:
             for k in range(n_ldus):
                 need = (k + 1) * FRAMES_PER_LDU
@@ -156,10 +160,7 @@ class VoiceCall:
                     if len(enc.out) < need:
                         return self._end(stream_id, False, 'failed', 'voice encoder stalled', t0, k)
                 imbe = enc.out[k * FRAMES_PER_LDU:need]
-                if k % 2 == 0:
-                    pkt = F.ldu1(p, imbe, self.control_byte, F.FRAME_TYPE_HDU_VALID)
-                else:
-                    pkt = F.ldu2(p, imbe, self.control_byte)
+                pkt = build_ldu(p, k, imbe, self.control_byte, self.encryptor)
 
                 delay = t0 + k * LDU_SECONDS - time.monotonic()
                 if delay > 0:

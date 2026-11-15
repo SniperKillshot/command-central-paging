@@ -24,6 +24,7 @@ import numpy as np
 from src.audio import dsp
 from src.dvm import protocol as dvm
 from src.p25 import frames as F
+from src.p25.crypto import build_ldu
 from src.p25.imbe import FRAME, IMBEEncoder, VocoderError, silence_frame
 from src.p25.voice import FRAMES_PER_LDU, LDU_SECONDS, encode_pcm
 from src.state import record_dispatch
@@ -44,7 +45,8 @@ class LiveError(Exception):
 class LiveSession:
     def __init__(self, peer, targets: List[Dict], max_seconds: float, lead_frames: List[bytes], sound: Optional[str],
                  lead_pcm: Optional[np.ndarray] = None):
-        """targets: [{'tgid', 'name', 'params': CallParams}]. The alert tone
+        """targets: [{'tgid', 'name', 'params': CallParams, 'encryptor'}]
+        (encryptor None = clear; each talkgroup can have its own key). The alert tone
         to play first is either already encoded (lead_frames) or int16 audio
         (lead_pcm) that this session's encoder codes before the speech, so the
         two are one continuous encode - no switch of encoder state between
@@ -235,7 +237,7 @@ class LiveSession:
                 t['refused'] = refusal
                 logger.warning(f"Live talk: TG {t['tgid']} {refusal}")
                 continue
-            pkt = F.ldu1(t['params'], imbe, 0, F.FRAME_TYPE_HDU_VALID) if k % 2 == 0 else F.ldu2(t['params'], imbe, 0)
+            pkt = build_ldu(t['params'], k, imbe, 0, t.get('encryptor'))
             if self.peer.send(dvm.Func.PROTOCOL, dvm.PROTOCOL_P25, pkt, t['stream'], k):
                 live += 1
         return live
@@ -316,7 +318,8 @@ class LiveTalk:
             lead_frames, lead_pcm = self._lead(sound)
             max_s = float(self.pager.settings.get('max_call_seconds', 120))
             self.session = LiveSession(self.pager.peer,
-                                       [{**t, 'params': self.pager.call_params(t['tgid'])} for t in targets],
+                                       [{**t, 'params': self.pager.call_params(t['tgid']),
+                                         'encryptor': self.pager.encryptor(t['tgid'])} for t in targets],
                                        max_s, lead_frames, sound, lead_pcm)
             logger.info(f"Live talk started: TG {', '.join(str(t['tgid']) for t in targets)}")
             return self.session

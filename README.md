@@ -227,6 +227,35 @@ Live talk encodes its alert tone and the speech after it with one encoder,
 for the same reason. The pure Python encoder has its own tone handling (it
 shifts generated tones onto its pitch grid) and is not used with blip25.
 
+### Encryption
+
+P25 voice encryption works the way dvmhost does it (`src/p25/crypto.py`):
+AES-256 (algorithm 0x84), ARC4/ADP (0xAA) and DES-OFB (0x81). Keys go in the
+`encryption:` section of `config.yaml`, each with its key ID (as in the radio
+codeplug) and the talkgroups to send encrypted with it:
+
+```yaml
+encryption:
+  keys:
+    - {kid: 0x561, algo: aes, key: "<64 hex digits>", talkgroups: [500]}
+    - {kid: 0x201, algo: arc4, key: "<10 hex digits>", talkgroups: [503]}
+```
+
+- **Receiving:** a call is decrypted when a configured key matches its
+  algorithm and key ID, whether or not its talkgroup is listed. A call joined
+  partway through starts playing at the next LDU2 (within about 0.4 s).
+- **Sending:** pages, alert tones and live talk to a listed talkgroup are
+  encrypted with that key, using a fresh random MI for each call. Its tile
+  shows the algorithm ("TG 500 · 🔒 AES-256"). Unlisted talkgroups are sent
+  in the clear.
+- **Safety:** if a listed key is missing or invalid, sending to its
+  talkgroups is refused ("not sending in the clear") instead of going out
+  unencrypted.
+
+Keys are read from `config.yaml` only. The FNE's key management
+(over-the-air key requests) is not supported. Keep `config.yaml` private; it
+is git-ignored.
+
 ## Dispatch console
 
 `http://<host>:5000/dispatch` is a full-screen radio console, made for a
@@ -238,7 +267,9 @@ touchscreen but usable with a mouse and keyboard:
   was last heard or paged. Tap tiles to select them; several can be selected.
 - **Listen**: turns on audio of calls heard from the FNE. The speaker button
   on each tile mutes or unmutes that talkgroup; calls on different
-  talkgroups play mixed together. Encrypted calls are shown but not played.
+  talkgroups play mixed together. Encrypted calls play if their key is
+  configured (the badge shows "RX 🔒"); without it they show as ENC and
+  aren't played. See [Encryption](#encryption).
 - **Hold to talk**: live voice to the selected talkgroups while the button
   (or Space) is held, about half a second behind real time. An optional
   alert tone can go first. Listening is muted while talking. One live call at

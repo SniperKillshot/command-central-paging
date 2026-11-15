@@ -66,6 +66,21 @@ dvm:
   rest_verify_tls: true    # false for a self-signed restSsl certificate
   names_refresh_minutes: 10
 
+# P25 voice encryption (AES-256, ARC4/ADP, DES-OFB), as dvmhost does it.
+# Received calls are decrypted with whichever key matches their algorithm and
+# key ID; without one they show as ENC and aren't played. Pages, tones and
+# live talk to a talkgroup listed under a key are sent encrypted with it;
+# other talkgroups go out in the clear. If a listed key is missing or invalid,
+# sending to its talkgroups is refused rather than sent in the clear.
+#   kid   key ID, as in the radio codeplug (0x561, or "561" - read as hex)
+#   algo  aes (64 hex digits), arc4/adp (10 hex digits), des (16 hex digits)
+# Keys are secrets: keep config.yaml private (it is git-ignored).
+encryption:
+  keys: []
+  # keys:
+  #   - {kid: 0x561, algo: aes, key: "<64 hex digits>", talkgroups: [500]}
+  #   - {kid: 0x201, algo: arc4, key: "<10 hex digits>", talkgroups: [503]}
+
 # Where pages can go. Each destination names a backend:
 #   mock - logs the page only; exercises the whole pipeline with no hardware
 #   p25  - P25 voice page to a talkgroup over the DVM FNE connection above:

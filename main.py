@@ -14,6 +14,7 @@ from src.dvm import FNEPeer
 from src.dvm.rest import TalkgroupDirectory
 from src.events import EventDetector
 from src.forewarned_client import ForewarnedClient
+from src.p25.crypto import KeyStore
 from src.p25.live import LiveTalk
 from src.p25.pager import P25Pager
 from src.p25.rx_audio import RxAudio
@@ -70,8 +71,12 @@ def main():
         else:
             logger.warning("dvm.rest_enabled is on but dvm.rest_password is empty - no talkgroup names")
 
+    keys = KeyStore(config.get('encryption', default={}) or {})
+    if len(keys):
+        logger.info(f"Encryption: {len(keys)} key(s); sending encrypted to TG "
+                    f"{', '.join(str(tg) for tg in sorted(keys.talkgroups())) or 'none'}")
     pager = P25Pager(config.get('p25', default={}) or {}, tts, sounds,
-                     voice_settings=lambda: settings.get('tts'), peer=dvm_peer)
+                     voice_settings=lambda: settings.get('tts'), peer=dvm_peer, keys=keys)
 
     routing = config.get('alert_routing', default={}) or {}
     detector = EventDetector(fire_on_startup=bool(routing.get('page_existing_on_startup', False)))
@@ -80,11 +85,11 @@ def main():
     dispatcher = Dispatcher(routing.get('rules', []), destinations, backends, sound_exists=sounds.exists)
     rx_audio = live = None
     if dvm_peer:
-        rx_audio = RxAudio()
+        rx_audio = RxAudio(keys)
         dvm_peer.on_voice = rx_audio.on_p25
         live = LiveTalk(pager)
     console = DispatchConsole(config.get('dispatch', default={}) or {}, destinations, dispatcher, sounds, live,
-                              store=settings, names=tg_names)
+                              store=settings, names=tg_names, keys=keys)
 
     def on_status(status) -> int:
         """Shared by the poller and the push webhook."""

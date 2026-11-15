@@ -81,6 +81,17 @@ ACL, duplicate peer ID...). Lost connections are retried automatically.
 
 P25 paging destinations use this connection (next section).
 
+**Talkgroup names.** The peer connection carries only talkgroup numbers. The
+names come from the FNE's talkgroup rules, through its REST API: set
+`rest_enabled: true` and `rest_password` in the `dvm:` section. On the FNE,
+under `system:`, set `restEnable: true`, a `restPassword`, and a
+`restAddress` this machine can reach. The default `127.0.0.1` is reachable
+only from the FNE itself; use `0.0.0.0` or its VPN address, and allow TCP
+`restPort` (9990) through any firewall or VPN policy. The names are refreshed
+every 10 minutes (`names_refresh_minutes`); the last good set is kept if the
+FNE stops answering. A console tile's own name, or a p25 destination's name,
+still wins. A tile left as "TG <n>" shows the FNE's name.
+
 ## P25 voice paging
 
 A page to a `p25` destination becomes a P25 group voice call to its

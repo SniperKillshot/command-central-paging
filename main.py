@@ -11,6 +11,7 @@ from src.config import Config
 from src.console import DispatchConsole
 from src.dispatcher import Dispatcher
 from src.dvm import FNEPeer
+from src.dvm.rest import TalkgroupDirectory
 from src.events import EventDetector
 from src.forewarned_client import ForewarnedClient
 from src.p25.live import LiveTalk
@@ -60,6 +61,15 @@ def main():
     else:
         logger.info("DVM FNE connection disabled (dvm.enabled: false)")
 
+    tg_names = None
+    if dvm_settings.get('enabled') and dvm_settings.get('rest_enabled'):
+        if dvm_settings.get('rest_password'):
+            tg_names = TalkgroupDirectory(dvm_settings)
+            tg_names.start()
+            atexit.register(tg_names.stop)
+        else:
+            logger.warning("dvm.rest_enabled is on but dvm.rest_password is empty - no talkgroup names")
+
     pager = P25Pager(config.get('p25', default={}) or {}, tts, sounds,
                      voice_settings=lambda: settings.get('tts'), peer=dvm_peer)
 
@@ -74,7 +84,7 @@ def main():
         dvm_peer.on_voice = rx_audio.on_p25
         live = LiveTalk(pager)
     console = DispatchConsole(config.get('dispatch', default={}) or {}, destinations, dispatcher, sounds, live,
-                              store=settings)
+                              store=settings, names=tg_names)
 
     def on_status(status) -> int:
         """Shared by the poller and the push webhook."""

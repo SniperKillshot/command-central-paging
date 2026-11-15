@@ -157,7 +157,7 @@ class LayoutTests(unittest.TestCase):
     def test_editor_starts_from_config(self):
         e = self.console.editor()
         self.assertEqual([t['id'] for t in e['talkgroups']], [3003, 1001, 2002])   # config + destination
-        self.assertEqual(e['fne_talkgroups'], [4004, 5005])
+        self.assertEqual(e['fne_talkgroups'], [{'id': 4004, 'name': ''}, {'id': 5005, 'name': ''}])
         self.assertEqual(e['tones'], ['hi_lo'])
         self.assertFalse(e['saved_in_browser'])
 
@@ -195,12 +195,13 @@ class LayoutTests(unittest.TestCase):
     def test_layout_api(self):
         app = create_app(services=Services(console=self.console), api_token='tok')
         c = app.test_client()
-        self.assertEqual(c.get('/api/dispatch/layout').get_json()['fne_talkgroups'], [4004, 5005])
+        self.assertEqual([t['id'] for t in c.get('/api/dispatch/layout').get_json()['fne_talkgroups']], [4004, 5005])
         body = {'talkgroups': [{'id': 1001, 'name': 'Ops'}], 'tones': ['alert_tone']}
         self.assertEqual(c.post('/api/dispatch/layout', json=body).status_code, 401)
         r = c.post('/api/dispatch/layout', json=body, headers={'X-Api-Token': 'tok'})
         self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.get_json()['talkgroups'], [{'id': 1001, 'name': 'Ops', 'color': None}])
+        self.assertEqual(r.get_json()['talkgroups'],
+                         [{'id': 1001, 'name': 'Ops', 'default_name': 'Ops Page', 'color': None}])
         r = c.post('/api/dispatch/layout', json={'talkgroups': [{'id': 'abc'}]}, headers={'X-Api-Token': 'tok'})
         self.assertEqual(r.status_code, 400)
         self.assertIn('not a talkgroup', r.get_json()['error'])

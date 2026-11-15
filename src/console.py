@@ -9,6 +9,11 @@ The tiles come from, in order:
 The dispatch settings start from config.yaml; once the tiles are edited on
 the console they are saved in the settings store and override it.
 
+A tile's name is, in order: the name set for it (config or the editor), the
+p25 destination's name, the talkgroup's name on the FNE (from its REST API,
+src/dvm/rest.py), or "TG <n>". A name left as "TG <n>" counts as no name, so
+the FNE's name shows instead.
+
 A tile that matches a p25 destination pages through that destination (so
 its own voice and name apply); any other talkgroup gets a destination made
 on the fly. Everything goes through the dispatcher, so console pages queue
@@ -41,8 +46,9 @@ def _tgid(v) -> Optional[int]:
 
 class DispatchConsole:
     def __init__(self, settings: Dict[str, Any], destinations: List[Dict[str, Any]], dispatcher=None,
-                 sounds=None, live=None, store=None):
+                 sounds=None, live=None, store=None, names=None):
         self.config = settings or {}
+        self.names = names         # TalkgroupDirectory: talkgroup names from the FNE, if enabled
         self.store = store         # SettingsStore: tile setup saved from the browser
         self.destinations = destinations or []
         self.dispatcher = dispatcher
@@ -53,6 +59,9 @@ class DispatchConsole:
     def settings(self) -> Dict[str, Any]:
         saved = self.store.get('dispatch') if self.store else {}
         return {**self.config, **saved}
+
+    def fne_name(self, tg: int) -> Optional[str]:
+        return self.names.name(tg) if self.names else None
 
     def tones(self) -> List[Dict[str, str]]:
         """Alert sound buttons: dispatch.tones in that order. An empty list in
@@ -73,12 +82,16 @@ class DispatchConsole:
         listed = {t['tgid'] for t in tiles}
         s = self.settings
         return {
-            'talkgroups': [{'id': t['tgid'], 'name': t['name'], 'color': t['color']} for t in tiles],
+            # name: the tile's own name ('' = none); default: what shows without one
+            'talkgroups': [{'id': t['tgid'], 'name': t['custom_name'], 'default_name': t['default_name'],
+                            'color': t['color']} for t in tiles],
             'show_fne_talkgroups': bool(s.get('show_fne_talkgroups', True)),
             'tones': [t['id'] for t in self.tones()],
             'available_tones': self.sounds.list() if self.sounds else [],
             'colors': list(COLORS),
-            'fne_talkgroups': [t['tgid'] for t in dvm.get('active_talkgroups') or [] if t['tgid'] not in listed],
+            'fne_talkgroups': [{'id': t['tgid'], 'name': self.fne_name(t['tgid']) or ''}
+                               for t in dvm.get('active_talkgroups') or [] if t['tgid'] not in listed],
+            'fne_names': self.names.status if self.names else None,
             'saved_in_browser': bool(self.store and self.store.get('dispatch')),
         }
 
@@ -101,7 +114,7 @@ class DispatchConsole:
             if tg in seen:
                 raise ValueError(f'talkgroup {tg} is on more than one tile')
             seen.add(tg)
-            name = ' '.join(str(row.get('name') or '').split())[:MAX_NAME] or f'TG {tg}'
+            name = ' '.join(str(row.get('name') or '').split())[:MAX_NAME]     # '' = use the default
             color = row.get('color') if row.get('color') in COLORS else None
             tiles.append({'id': tg, 'name': name, 'color': color})
         available = [x['id'] for x in (self.sounds.list() if self.sounds else [])]
@@ -145,24 +158,34 @@ class DispatchConsole:
             t = t if isinstance(t, dict) else {}
             dest = by_tg.get(tg)
             tiles.setdefault(tg, {
-                'tgid': tg, 'name': str(t.get('name') or (dest or {}).get('name') or f'TG {tg}'),
+                'tgid': tg, 'custom_name': self._own_name(t.get('name'), tg),
                 'color': t.get('color') if t.get('color') in COLORS else None,
                 'destination': (dest or {}).get('id'), 'source': 'config',
             })
         if settings.get('include_destinations', True):
             for tg, dest in by_tg.items():
-                tiles.setdefault(tg, {'tgid': tg, 'name': str(dest.get('name') or f'TG {tg}'), 'color': None,
+                tiles.setdefault(tg, {'tgid': tg, 'custom_name': '', 'color': None,
                                       'destination': dest['id'], 'source': 'destination'})
         fne = {t['tgid']: t for t in (dvm or {}).get('active_talkgroups') or []}
         if settings.get('show_fne_talkgroups', True):
             for tg in sorted(fne):
-                tiles.setdefault(tg, {'tgid': tg, 'name': f'TG {tg}', 'color': None,
+                tiles.setdefault(tg, {'tgid': tg, 'custom_name': '', 'color': None,
                                       'destination': None, 'source': 'fne'})
+        for tg, tile in tiles.items():
+            dest_name = self._own_name((by_tg.get(tg) or {}).get('name'), tg)
+            tile['default_name'] = dest_name or self.fne_name(tg) or f'TG {tg}'
+            tile['name'] = tile['custom_name'] or tile['default_name']
         for tile in tiles.values():
             info = fne.get(tile['tgid'])
             tile['on_fne'] = info is not None
             tile['affiliated'] = bool(info and info.get('affiliated'))
         return list(tiles.values())
+
+    @staticmethod
+    def _own_name(name, tg: int) -> str:
+        """A name someone set, or '' - "TG <n>" is the placeholder, not a name."""
+        name = ' '.join(str(name or '').split())
+        return '' if name.upper().replace(' ', '') == f'TG{tg}' else name
 
     def _destination(self, tg: int, name: str, dest_id: Optional[str]) -> Dict[str, Any]:
         for d in self.destinations:
@@ -208,20 +231,21 @@ class DispatchConsole:
             'live': live,
             'live_available': self.live is not None,
             'fne': {k: dvm.get(k) for k in ('enabled', 'connected', 'state', 'last_error', 'master', 'rtt_ms')},
+            'fne_names': self.names.status if self.names else None,
             'alert': {'level': (fw.get('local_alert_state') or {}).get('level', 'none'),
                       'reason': (fw.get('local_alert_state') or {}).get('reason', ''),
                       'reachable': fw.get('reachable', False)},
             'activity': self._activity(dvm, snap.get('dispatches') or [], by_tg),
         }
 
-    @staticmethod
-    def _activity(dvm, dispatches, by_tg) -> List[Dict[str, Any]]:
+    def _activity(self, dvm, dispatches, by_tg) -> List[Dict[str, Any]]:
         """Recent calls heard and pages sent, newest first."""
         items = []
         for c in (dvm.get('calls') or []) + (dvm.get('recent_calls') or []):
             tile = by_tg.get(c.get('dst_id'))
             items.append({'kind': 'rx', 'time': c.get('started'), 'tgid': c.get('dst_id'),
-                          'name': tile['name'] if tile else f"TG {c.get('dst_id')}",
+                          'name': tile['name'] if tile else (self.fne_name(c.get('dst_id') or 0)
+                                                             or f"TG {c.get('dst_id')}"),
                           'text': f"RID {c.get('src_id')}", 'active': c.get('active', False),
                           'ended': c.get('ended')})
         for d in dispatches[:20]:
@@ -243,7 +267,7 @@ class DispatchConsole:
             tg = _tgid(v)
             if tg is None:
                 raise ValueError(f"'{v}' is not a talkgroup number (1-65535)")
-            tile = tiles.get(tg, {'name': f'TG {tg}', 'destination': None})
+            tile = tiles.get(tg, {'name': self.fne_name(tg) or f'TG {tg}', 'destination': None})
             out.append(self._destination(tg, tile['name'], tile.get('destination')))
         return out
 

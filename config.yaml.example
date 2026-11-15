@@ -54,6 +54,17 @@ dvm:
   ping_interval: 10        # seconds between keepalive pings (dvmhost uses 10)
   retry_interval: 10       # seconds between login retries / reconnects
   timeout: 60              # seconds of silence from the FNE before reconnecting
+  # Talkgroup names for the dispatch console, read from the FNE's REST API
+  # (its talkgroup rules). The FNE needs, under system: in its config,
+  # restEnable: true, a restPassword, and restAddress reachable from here
+  # (0.0.0.0 or its VPN address - the default 127.0.0.1 is local only).
+  rest_enabled: false
+  rest_address: ""         # blank = same host as address above
+  rest_port: 9990          # the FNE's restPort
+  rest_password: ""        # the FNE's restPassword   env override: DVM_FNE_REST_PASSWORD
+  rest_https: false        # the FNE's restSsl
+  rest_verify_tls: true    # false for a self-signed restSsl certificate
+  names_refresh_minutes: 10
 
 # Where pages can go. Each destination names a backend:
 #   mock - logs the page only; exercises the whole pipeline with no hardware

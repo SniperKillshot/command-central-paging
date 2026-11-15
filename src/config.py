@@ -73,6 +73,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         'ping_interval': 10,
         'retry_interval': 10,
         'timeout': 60,
+        # talkgroup names from the FNE's REST API (src/dvm/rest.py)
+        'rest_enabled': False,
+        'rest_address': '',          # blank = same host as address
+        'rest_port': 9990,
+        'rest_password': '',
+        'rest_https': False,
+        'rest_verify_tls': True,
+        'names_refresh_minutes': 10,
     },
     'paging_destinations': [],
     'alert_routing': {
@@ -100,6 +108,7 @@ ENV_OVERRIDES = {
     'DVM_FNE_ADDRESS': ('dvm', 'address'),
     'DVM_FNE_PASSWORD': ('dvm', 'password'),
     'DVM_FNE_PRESHARED_KEY': ('dvm', 'preshared_key'),
+    'DVM_FNE_REST_PASSWORD': ('dvm', 'rest_password'),
     'WEB_API_TOKEN': ('web', 'api_token'),
 }
 

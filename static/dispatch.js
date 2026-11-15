@@ -798,8 +798,11 @@ function loadEditor(data) {
     editor.tones = new Set(data.tones);
     editor.dirty = false;
     $('editor-show-fne').checked = data.show_fne_talkgroups;
-    $('editor-source').textContent = data.saved_in_browser
-        ? 'Set up on the console (overrides config.yaml)' : 'Currently from config.yaml';
+    const n = data.fne_names;
+    $('editor-source').textContent = (data.saved_in_browser
+        ? 'Set up on the console (overrides config.yaml)' : 'Currently from config.yaml') +
+        (!n ? '' : n.ok ? ` · ${n.count} talkgroup names from the FNE`
+            : ` · FNE talkgroup names unavailable${n.error ? ': ' + n.error : ''}`);
     $('editor-reset').disabled = !data.saved_in_browser;
     renderEditor();
 }
@@ -832,13 +835,18 @@ function renderEditor() {
         list.replaceChildren(...editor.rows.map((row, i) => editorRow(row, i)));
     }
     const listed = new Set(editor.rows.map(r => Number(r.id)));
-    const fne = editor.data.fne_talkgroups.filter(tg => !listed.has(tg));
+    const fne = editor.data.fne_talkgroups.filter(t => !listed.has(t.id));
     $('editor-fne-box').classList.toggle('hidden', !fne.length);
-    $('editor-fne').replaceChildren(...fne.map(tg => {
+    $('editor-fne').replaceChildren(...fne.map(t => {
         const b = document.createElement('button');
         b.className = 'chip';
-        b.textContent = `+ TG ${tg}`;
-        b.addEventListener('click', () => { editor.rows.push({ id: tg, name: `TG ${tg}`, color: null }); changed(); renderEditor(); });
+        b.textContent = t.name ? `+ ${t.name} (${t.id})` : `+ TG ${t.id}`;
+        // no name of its own: the tile shows the FNE's name, and follows it if it changes
+        b.addEventListener('click', () => {
+            editor.rows.push({ id: t.id, name: '', default_name: t.name || `TG ${t.id}`, color: null });
+            changed();
+            renderEditor();
+        });
         return b;
     }));
     $('editor-tones').replaceChildren(...editor.data.available_tones.map(t => {
@@ -883,7 +891,7 @@ function editorRow(row, i) {
     name.type = 'text';
     name.maxLength = 40;
     name.className = 'name-in';
-    name.placeholder = 'Name';
+    name.placeholder = row.default_name || 'Name (blank = name from the FNE)';
     name.value = row.name;
     name.setAttribute('aria-label', 'Tile name');
     name.addEventListener('input', () => { row.name = name.value; changed(); });

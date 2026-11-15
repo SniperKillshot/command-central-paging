@@ -54,8 +54,13 @@ dvm:
   ping_interval: 10        # seconds between keepalive pings (dvmhost uses 10)
   retry_interval: 10       # seconds between login retries / reconnects
   timeout: 60              # seconds of silence from the FNE before reconnecting
-  # Talkgroup names for the dispatch console, read from the FNE's REST API
-  # (its talkgroup rules). The FNE needs, under system: in its config,
+  # Radio aliases for the console, asked of the FNE over the peer link after
+  # login and every this many minutes (0 = off). Needs a dvmfne with radio
+  # alias sync (r05a06_dev and later) and a radio alias file, and UDP to its
+  # metadata port (port + 1, e.g. 63031) allowed from here.
+  alias_sync_minutes: 10
+  # Talkgroup names and radio aliases for the console, read from the FNE's
+  # REST API (its talkgroup rules and radio ID list). The FNE needs, under system: in its config,
   # restEnable: true, a restPassword, and restAddress reachable from here
   # (0.0.0.0 or its VPN address - the default 127.0.0.1 is local only).
   rest_enabled: false

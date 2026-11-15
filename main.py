@@ -11,7 +11,7 @@ from src.config import Config
 from src.console import DispatchConsole
 from src.dispatcher import Dispatcher
 from src.dvm import FNEPeer
-from src.dvm.rest import TalkgroupDirectory
+from src.dvm.rest import FNEDirectory
 from src.events import EventDetector
 from src.forewarned_client import ForewarnedClient
 from src.p25.crypto import KeyStore
@@ -62,14 +62,14 @@ def main():
     else:
         logger.info("DVM FNE connection disabled (dvm.enabled: false)")
 
-    tg_names = None
+    fne_directory = None       # talkgroup names and radio aliases from the FNE's REST API
     if dvm_settings.get('enabled') and dvm_settings.get('rest_enabled'):
         if dvm_settings.get('rest_password'):
-            tg_names = TalkgroupDirectory(dvm_settings)
-            tg_names.start()
-            atexit.register(tg_names.stop)
+            fne_directory = FNEDirectory(dvm_settings)
+            fne_directory.start()
+            atexit.register(fne_directory.stop)
         else:
-            logger.warning("dvm.rest_enabled is on but dvm.rest_password is empty - no talkgroup names")
+            logger.warning("dvm.rest_enabled is on but dvm.rest_password is empty - no talkgroup names or radio aliases")
 
     keys = KeyStore(config.get('encryption', default={}) or {})
     if len(keys):
@@ -89,7 +89,8 @@ def main():
         dvm_peer.on_voice = rx_audio.on_p25
         live = LiveTalk(pager)
     console = DispatchConsole(config.get('dispatch', default={}) or {}, destinations, dispatcher, sounds, live,
-                              store=settings, names=tg_names, keys=keys)
+                              store=settings, names=fne_directory, keys=keys,
+                              radio_aliases=dvm_peer.alias if dvm_peer else None)
 
     def on_status(status) -> int:
         """Shared by the poller and the push webhook."""

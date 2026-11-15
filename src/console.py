@@ -47,10 +47,14 @@ def _tgid(v) -> Optional[int]:
 
 class DispatchConsole:
     def __init__(self, settings: Dict[str, Any], destinations: List[Dict[str, Any]], dispatcher=None,
-                 sounds=None, live=None, store=None, names=None, keys=None):
+                 sounds=None, live=None, store=None, names=None, keys=None, radio_aliases=None):
+        """radio_aliases: callable rid -> alias or None (the FNE peer's synced
+        alias table); names: FNEDirectory (REST) for talkgroup names and, as a
+        fallback, aliases."""
         self.config = settings or {}
+        self.radio_aliases = radio_aliases
         self.keys = keys           # KeyStore: talkgroups sent encrypted
-        self.names = names         # TalkgroupDirectory: talkgroup names from the FNE, if enabled
+        self.names = names         # FNEDirectory: talkgroup names and radio aliases, if enabled
         self.store = store         # SettingsStore: tile setup saved from the browser
         self.destinations = destinations or []
         self.dispatcher = dispatcher
@@ -64,6 +68,17 @@ class DispatchConsole:
 
     def fne_name(self, tg: int) -> Optional[str]:
         return self.names.name(tg) if self.names else None
+
+    def alias(self, rid) -> Optional[str]:
+        """A radio's alias: the FNE peer's synced table first, then the REST API's."""
+        found = self.radio_aliases(rid) if self.radio_aliases else None
+        return found or (self.names.alias(rid) if self.names else None)
+
+    def with_alias(self, call: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """A copy of a call with the talking radio's alias (src_alias) added."""
+        if not call:
+            return call
+        return {**call, 'src_alias': self.alias(call.get('src_id'))}
 
     def tones(self) -> List[Dict[str, str]]:
         """Alert sound buttons: dispatch.tones in that order. An empty list in
@@ -209,10 +224,10 @@ class DispatchConsole:
 
         for call in reversed(dvm.get('recent_calls') or []):
             if call.get('dst_id') in by_tg:
-                by_tg[call['dst_id']]['last_rx'] = call
+                by_tg[call['dst_id']]['last_rx'] = self.with_alias(call)
         for call in dvm.get('calls') or []:
             if call.get('dst_id') in by_tg:
-                by_tg[call['dst_id']]['rx'] = call
+                by_tg[call['dst_id']]['rx'] = self.with_alias(call)
         for job in (self.dispatcher.jobs() if self.dispatcher else []):
             t = by_tg.get(_tgid(job.get('talkgroup')))
             if t and t['tx'] != 'sending':
@@ -242,6 +257,10 @@ class DispatchConsole:
             'activity': self._activity(dvm, snap.get('dispatches') or [], by_tg),
         }
 
+    def _radio(self, rid) -> str:
+        alias = self.alias(rid)
+        return f'{alias} ({rid})' if alias else f'RID {rid}'
+
     def _activity(self, dvm, dispatches, by_tg) -> List[Dict[str, Any]]:
         """Recent calls heard and pages sent, newest first."""
         items = []
@@ -250,7 +269,7 @@ class DispatchConsole:
             items.append({'kind': 'rx', 'time': c.get('started'), 'tgid': c.get('dst_id'),
                           'name': tile['name'] if tile else (self.fne_name(c.get('dst_id') or 0)
                                                              or f"TG {c.get('dst_id')}"),
-                          'text': f"RID {c.get('src_id')}", 'active': c.get('active', False),
+                          'text': self._radio(c.get('src_id')), 'active': c.get('active', False),
                           'ended': c.get('ended')})
         for d in dispatches[:20]:
             items.append({'kind': 'tx', 'time': d.get('timestamp'), 'tgid': _tgid(d.get('talkgroup')),

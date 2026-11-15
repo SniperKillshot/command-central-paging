@@ -167,7 +167,7 @@ function renderTiles() {
         const detail = el.querySelector('.tile-detail');
         if (tx === 'sending') { badge.textContent = t.live ? 'LIVE' : 'TX'; detail.textContent = t.live ? 'Talking' : 'Transmitting'; }
         else if (tx === 'queued') { badge.textContent = 'QUEUED'; detail.textContent = 'Waiting for channel'; }
-        else if (rx) { badge.textContent = enc ? 'ENC' : sec ? 'RX 🔒' : 'RX'; detail.textContent = `${rx.src_id}  ${elapsed(rx.started)}`; }
+        else if (rx) { badge.textContent = enc ? 'ENC' : sec ? 'RX 🔒' : 'RX'; detail.textContent = `${rx.src_alias || rx.src_id}  ${elapsed(rx.started)}`; }
         else { badge.textContent = 'IDLE'; detail.textContent = ''; }
 
         const last = el.querySelector('.tile-last');
@@ -180,8 +180,8 @@ function renderTiles() {
             last.title = lp.detail || '';
             if (!lp.success) last.classList.add('failed');
         } else if (lr) {
-            last.textContent = `Heard ${lr.src_id}, ${ago(lr.ended || lr.started)}`;
-            last.title = '';
+            last.textContent = `Heard ${lr.src_alias || lr.src_id}, ${ago(lr.ended || lr.started)}`;
+            last.title = lr.src_alias ? `Radio ID ${lr.src_id}` : '';
         } else {
             last.textContent = '';
         }
@@ -806,7 +806,7 @@ function loadEditor(data) {
     const n = data.fne_names;
     $('editor-source').textContent = (data.saved_in_browser
         ? 'Set up on the console (overrides config.yaml)' : 'Currently from config.yaml') +
-        (!n ? '' : n.ok ? ` · ${n.count} talkgroup names from the FNE`
+        (!n ? '' : n.ok ? ` · ${n.count} talkgroup names and ${n.aliases} radio aliases from the FNE`
             : ` · FNE talkgroup names unavailable${n.error ? ': ' + n.error : ''}`);
     $('editor-reset').disabled = !data.saved_in_browser;
     renderEditor();

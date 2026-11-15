@@ -73,6 +73,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         'ping_interval': 10,
         'retry_interval': 10,
         'timeout': 60,
+        'alias_sync_minutes': 10,    # radio aliases over the peer link (FNE r05a06+); 0 = off
         # talkgroup names from the FNE's REST API (src/dvm/rest.py)
         'rest_enabled': False,
         'rest_address': '',          # blank = same host as address

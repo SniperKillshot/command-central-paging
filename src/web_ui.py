@@ -68,6 +68,8 @@ def create_app(on_status: Optional[Callable[[Dict[str, Any]], int]] = None,
     def api_state():
         state = snapshot()
         state['api_token_required'] = bool(api_token)
+        if svc.console and (state.get('dvm') or {}).get('last_call'):
+            state['dvm']['last_call'] = svc.console.with_alias(state['dvm']['last_call'])
         return jsonify(state)
 
     @app.route('/api/forewarned/push', methods=['POST'])

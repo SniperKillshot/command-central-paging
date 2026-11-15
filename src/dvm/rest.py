@@ -1,18 +1,19 @@
-"""Talkgroup names from the DVM FNE's REST API.
+"""Talkgroup names and radio aliases from the DVM FNE's REST API.
 
-The peer connection only carries talkgroup numbers; the names live in the
-FNE's talkgroup rules file, which dvmfne serves over its REST API (off by
-default - the FNE needs restEnable: true, a restPassword, and restAddress
-reachable from here; see the README).
+The peer connection only carries numbers; the names live in the FNE's
+talkgroup rules and radio ID files, which dvmfne serves over its REST API
+(off by default - the FNE needs restEnable: true, a restPassword, and
+restAddress reachable from here; see the README).
 
     PUT /auth       {"auth": hex(SHA-256(password))} -> {"token": "<decimal>"}
     GET /tg/query   header X-DVM-Auth-Token: <token>
                     -> {"tgs": [{"name", "alias", "invalid",
                                  "source": {"tgid", "slot"},
                                  "config": {"active", "affiliated", ...}}]}
+    GET /rid/query  -> {"rids": [{"id", "enabled", "alias"}]}
 
-TalkgroupDirectory fetches the list at start and every few minutes after,
-keeping the last good copy if the FNE stops answering.
+FNEDirectory fetches both at start and every few minutes after, keeping the
+last good copy of each if the FNE stops answering.
 """
 import hashlib
 import logging
@@ -108,8 +109,23 @@ class FNERest:
         return out
 
 
-class TalkgroupDirectory:
-    """Talkgroup names from the FNE, refreshed in the background."""
+
+    def radio_ids(self) -> List[Dict[str, Any]]:
+        """The FNE's radio ID list: [{'id', 'enabled', 'alias'}]."""
+        out = []
+        for r in self.get('/rid/query').get('rids') or []:
+            try:
+                rid = int(r.get('id'))
+            except (TypeError, ValueError):
+                continue
+            out.append({'id': rid, 'enabled': bool(r.get('enabled', True)),
+                        'alias': str(r.get('alias') or '').strip()})
+        return out
+
+
+class FNEDirectory:
+    """Talkgroup names and radio aliases from the FNE, refreshed in the
+    background. Each list keeps its last good copy if fetching it fails."""
 
     def __init__(self, settings: Dict[str, Any], client: Optional[FNERest] = None,
                  on_status: Optional[Callable[[Dict[str, Any]], None]] = None):
@@ -123,11 +139,13 @@ class TalkgroupDirectory:
         self.client = client
         self.on_status = on_status
         self._names: Dict[int, str] = {}
+        self._aliases: Dict[int, str] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self.status: Dict[str, Any] = {'enabled': True, 'ok': None, 'count': 0, 'fetched': None,
-                                       'error': None, 'url': client.base_url}
+        self._errors: Dict[str, str] = {}
+        self.status: Dict[str, Any] = {'enabled': True, 'ok': None, 'count': 0, 'aliases': 0,
+                                       'fetched': None, 'error': None, 'url': client.base_url}
 
     # -- lookups ----------------------------------------------------------------
 
@@ -139,40 +157,65 @@ class TalkgroupDirectory:
         with self._lock:
             return dict(self._names)
 
+    def alias(self, rid) -> Optional[str]:
+        try:
+            rid = int(rid)
+        except (TypeError, ValueError):
+            return None
+        with self._lock:
+            return self._aliases.get(rid)
+
+    def aliases(self) -> Dict[int, str]:
+        with self._lock:
+            return dict(self._aliases)
+
     # -- fetching ---------------------------------------------------------------
 
-    def refresh(self) -> bool:
-        """Fetch the list now. Keeps the previous names if it fails."""
+    def _fetch(self, what: str, fetch):
+        """Run one fetch; log a failure once until it changes. None if it failed."""
         try:
-            tgs = self.client.talkgroups()
+            result = fetch()
         except (FNERestError, ValueError) as e:
-            first = self.status['ok'] is not False or self.status['error'] != str(e)
-            self.status.update(ok=False, error=str(e))
-            if first:
-                logger.warning(f'Talkgroup names: {e}')
-            self._publish()
-            return False
-        names = {}
-        for tg in tgs:
-            label = tg['name'] or tg['alias']
-            if label and not tg['invalid']:
-                names.setdefault(tg['tgid'], label)
+            if self._errors.get(what) != str(e):
+                logger.warning(f'{what}: {e}')
+            self._errors[what] = str(e)
+            return None
+        self._errors.pop(what, None)
+        return result
+
+    def refresh(self) -> bool:
+        """Fetch both lists now. True if both came back."""
+        tgs = self._fetch('Talkgroup names', self.client.talkgroups)
+        rids = self._fetch('Radio aliases', self.client.radio_ids)
         with self._lock:
-            changed = names != self._names
-            self._names = names
-        if changed or self.status['ok'] is not True:
-            logger.info(f'Talkgroup names: {len(names)} from the FNE')
-        self.status.update(ok=True, error=None, count=len(names),
-                           fetched=datetime.now().isoformat(timespec='seconds'))
+            if tgs is not None:
+                names = {}
+                for tg in tgs:
+                    label = tg['name'] or tg['alias']
+                    if label and not tg['invalid']:
+                        names.setdefault(tg['tgid'], label)
+                if names != self._names:
+                    logger.info(f'Talkgroup names: {len(names)} from the FNE')
+                self._names = names
+            if rids is not None:
+                aliases = {r['id']: r['alias'] for r in rids if r['alias']}
+                if aliases != self._aliases:
+                    logger.info(f'Radio aliases: {len(aliases)} from the FNE')
+                self._aliases = aliases
+            ok = not self._errors
+            self.status.update(ok=ok, error='; '.join(self._errors.values()) or None,
+                               count=len(self._names), aliases=len(self._aliases))
+            if tgs is not None or rids is not None:
+                self.status['fetched'] = datetime.now().isoformat(timespec='seconds')
         self._publish()
-        return True
+        return ok
 
     def _publish(self) -> None:
         if self.on_status:
             try:
                 self.on_status(dict(self.status))
             except Exception:
-                logger.exception('talkgroup name status callback failed')
+                logger.exception('FNE directory status callback failed')
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -181,7 +224,7 @@ class TalkgroupDirectory:
 
     def start(self) -> None:
         if self._thread is None:
-            self._thread = threading.Thread(target=self._run, name='fne-tg-names', daemon=True)
+            self._thread = threading.Thread(target=self._run, name='fne-directory', daemon=True)
             self._thread.start()
 
     def stop(self) -> None:

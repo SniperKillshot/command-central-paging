@@ -5,7 +5,7 @@ import unittest
 
 from src import state
 from src.console import DispatchConsole
-from src.dvm.rest import AUTH_HEADER, FNERest, FNERestError, TalkgroupDirectory, password_hash
+from src.dvm.rest import AUTH_HEADER, FNERest, FNERestError, FNEDirectory, password_hash
 
 TGS = {'status': 200, 'tgs': [
     {'name': 'Ops 1', 'alias': 'OPS1', 'invalid': False, 'source': {'tgid': 1001, 'slot': 1},
@@ -13,6 +13,13 @@ TGS = {'status': 200, 'tgs': [
     {'name': '', 'alias': 'FIRE', 'invalid': False, 'source': {'tgid': 2002, 'slot': 1}, 'config': {}},
     {'name': 'Old', 'alias': '', 'invalid': True, 'source': {'tgid': 3003, 'slot': 1}, 'config': {}},
     {'name': 'Statewide', 'alias': '', 'invalid': False, 'source': {'tgid': 10037, 'slot': 1}, 'config': {}},
+]}
+
+
+RIDS = {'status': 200, 'rids': [
+    {'id': 251933, 'enabled': True, 'alias': 'VK4ABC Mobile'},
+    {'id': 12007, 'enabled': True, 'alias': ''},
+    {'id': 252007, 'enabled': False, 'alias': 'CCPAGING'},
 ]}
 
 
@@ -46,7 +53,13 @@ class FakeFNE:
         self.calls.append(('GET', url, headers))
         if (headers or {}).get(AUTH_HEADER) != self.valid:
             return FakeResponse(401, {'status': 401, 'message': 'invalid authentication token'})
+        if url.endswith('/rid/query'):
+            if self.rid_broken:
+                return FakeResponse(500, {'status': 500, 'message': 'no RID lookup'})
+            return FakeResponse(200, RIDS)
         return FakeResponse(200, TGS)
+
+    rid_broken = False
 
 
 class RestTests(unittest.TestCase):
@@ -81,7 +94,7 @@ class RestTests(unittest.TestCase):
 
 class DirectoryTests(unittest.TestCase):
     def directory(self, fne=None):
-        return TalkgroupDirectory({}, client=FNERest('http://fne:9990', 'secret', session=fne or FakeFNE()))
+        return FNEDirectory({}, client=FNERest('http://fne:9990', 'secret', session=fne or FakeFNE()))
 
     def test_names_prefer_name_then_alias_and_skip_invalid(self):
         d = self.directory()
@@ -102,10 +115,10 @@ class DirectoryTests(unittest.TestCase):
         self.assertEqual(d.name(1001), 'Ops 1')
 
     def test_settings_build_the_url(self):
-        d = TalkgroupDirectory({'address': 'fne.example', 'rest_port': 9991, 'rest_https': True,
+        d = FNEDirectory({'address': 'fne.example', 'rest_port': 9991, 'rest_https': True,
                                 'rest_password': 'p'})
         self.assertEqual(d.client.base_url, 'https://fne.example:9991')
-        d = TalkgroupDirectory({'address': 'fne.example', 'rest_address': '10.0.0.5'})
+        d = FNEDirectory({'address': 'fne.example', 'rest_address': '10.0.0.5'})
         self.assertEqual(d.client.base_url, 'http://10.0.0.5:9990')
 
 
@@ -113,7 +126,7 @@ class ConsoleNameTests(unittest.TestCase):
     DESTS = [{'id': 'fire', 'name': 'Fire Page', 'backend': 'p25', 'talkgroup': '2002'}]
 
     def setUp(self):
-        self.names = TalkgroupDirectory({}, client=FNERest('http://fne:9990', 'secret', session=FakeFNE()))
+        self.names = FNEDirectory({}, client=FNERest('http://fne:9990', 'secret', session=FakeFNE()))
         self.names.refresh()
         state.update_dvm_state({'enabled': True, 'connected': True,
                                 'active_talkgroups': [{'tgid': 1001}, {'tgid': 2002}, {'tgid': 10037},
@@ -159,6 +172,62 @@ class ConsoleNameTests(unittest.TestCase):
         c = DispatchConsole({'talkgroups': [{'id': 10037}]}, [])
         self.assertEqual(c.talkgroups(state.snapshot()['dvm'])[0]['name'], 'TG 10037')
         self.assertIsNone(c.state()['fne_names'])
+        self.assertIsNone(c.with_alias({'src_id': 251933})['src_alias'])
+
+
+class RadioAliasTests(unittest.TestCase):
+    CALL = {'dst_id': 500, 'src_id': 251933, 'started': '2026-11-15T12:00:00', 'active': True,
+            'stream_id': 9}
+
+    def setUp(self):
+        self.fne = FakeFNE()
+        self.dir = FNEDirectory({}, client=FNERest('http://fne:9990', 'secret', session=self.fne))
+        self.dir.refresh()
+
+    def tearDown(self):
+        state.update_dvm_state({'enabled': False})
+
+    def test_aliases_from_the_fne(self):
+        self.assertEqual(self.dir.aliases(), {251933: 'VK4ABC Mobile', 252007: 'CCPAGING'})   # blank skipped
+        self.assertEqual(self.dir.alias('251933'), 'VK4ABC Mobile')
+        self.assertIsNone(self.dir.alias(12007))
+        self.assertIsNone(self.dir.alias(None))
+        self.assertEqual((self.dir.status['count'], self.dir.status['aliases']), (3, 2))
+
+    def test_one_list_failing_keeps_the_other(self):
+        self.fne.rid_broken = True
+        with self.assertLogs('src.dvm.rest', 'WARNING'):
+            self.assertFalse(self.dir.refresh())
+        self.assertEqual(self.dir.alias(251933), 'VK4ABC Mobile')      # last good copy
+        self.assertEqual(self.dir.name(1001), 'Ops 1')                  # talkgroup names still fresh
+        self.assertIn('no RID lookup', self.dir.status['error'])
+        self.fne.rid_broken = False
+        self.assertTrue(self.dir.refresh())
+        self.assertIsNone(self.dir.status['error'])
+
+    def test_console_shows_aliases(self):
+        state.update_dvm_state({'enabled': True, 'connected': True, 'active_talkgroups': [{'tgid': 500}],
+                                'calls': [self.CALL],
+                                'recent_calls': [{**self.CALL, 'src_id': 12007, 'active': False,
+                                                  'ended': '2026-11-15T11:59:00'}]})
+        c = DispatchConsole({'talkgroups': [{'id': 500, 'name': 'CT OPS'}]}, [], names=self.dir)
+        st = c.state()
+        tile = st['talkgroups'][0]
+        self.assertEqual(tile['rx']['src_alias'], 'VK4ABC Mobile')
+        self.assertIsNone(tile['last_rx']['src_alias'])                 # no alias: the ID shows
+        heard = [i['text'] for i in st['activity'] if i['kind'] == 'rx']
+        self.assertIn('VK4ABC Mobile (251933)', heard)
+        self.assertIn('RID 12007', heard)
+
+    def test_dashboard_last_call_has_the_alias(self):
+        from src.web_ui import Services, create_app
+        state.update_dvm_state({'enabled': True, 'connected': True, 'last_call': self.CALL})
+        c = DispatchConsole({'talkgroups': []}, [], names=self.dir)
+        app = create_app(services=Services(console=c))
+        self.assertEqual(app.test_client().get('/api/state').get_json()['dvm']['last_call']['src_alias'],
+                         'VK4ABC Mobile')
+        # and without a console it still answers
+        self.assertEqual(create_app().test_client().get('/api/state').status_code, 200)
 
 
 if __name__ == '__main__':

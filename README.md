@@ -81,8 +81,19 @@ ACL, duplicate peer ID...). Lost connections are retried automatically.
 
 P25 paging destinations use this connection (next section).
 
-**Talkgroup names.** The peer connection carries only talkgroup numbers. The
-names come from the FNE's talkgroup rules, through its REST API: set
+**Radio aliases.** A dvmfne from the `r05a06_dev` branch on serves its radio
+alias table to logged-in peers (`NET_FUNC` 0x85, the same request dvmconsole's
+`syncRadioAliases` makes). This peer asks for it a few seconds after logging
+in and every `alias_sync_minutes` (default 10), on the FNE's metadata port:
+its traffic port + 1, so allow that UDP port too if a firewall or VPN policy
+sits in between. The FNE needs a radio alias file; older FNEs don't answer,
+and nothing else changes. Aliases replace radio IDs wherever a caller is shown
+(tiles, the activity strip, the dashboard's last call); a radio without an
+alias still shows its ID.
+
+**Talkgroup names (and aliases on older FNEs).** Talkgroup names come from
+the FNE's talkgroup rules through its REST API, which also has the radio ID
+list's aliases (used when the peer link has none for a radio): set
 `rest_enabled: true` and `rest_password` in the `dvm:` section. On the FNE,
 under `system:`, set `restEnable: true`, a `restPassword`, and a
 `restAddress` this machine can reach. The default `127.0.0.1` is reachable

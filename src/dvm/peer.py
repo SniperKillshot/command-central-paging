@@ -35,6 +35,8 @@ RECV_TIMEOUT = 0.25            # seconds; also the timer resolution
 CALL_IDLE_TIMEOUT = 3.0        # a heard call with no frames for this long has ended
 RECENT_CALLS = 20
 LONG_BACKOFF = 60.0            # after ACL / duplicate-connection rejections
+ALIAS_FIRST_DELAY = 3.0        # after login, before asking for the radio alias table
+ALIAS_RETRY = 60.0             # no (complete) answer: ask again this much later
 
 
 class PeerState(str, Enum):
@@ -72,6 +74,9 @@ class FNEPeer:
         self.timeout = float(settings.get('timeout', 60))
         self.peer_config = p.build_peer_config(settings, SOFTWARE_ID)
         self.identity = self.peer_config['identity']
+        # radio aliases, asked of the FNE after login and every so often
+        # (NET_FUNC 0x85 to its metadata port; 0 minutes = never)
+        self.alias_interval = float(settings.get('alias_sync_minutes', 10) or 0) * 60
 
         self.on_status = on_status
         # on_voice(stream_id, P25Header, payload): every P25 frame heard, e.g. for RX audio
@@ -83,6 +88,12 @@ class FNEPeer:
         self._send_lock = threading.Lock()
         self._sock: Optional[socket.socket] = None
         self._master_addr = None
+        self._metadata_addr = None
+        self._aliases: Dict[int, str] = {}
+        self._alias_lock = threading.Lock()
+        self._alias_stream_id = 0
+        self._alias_frags = p.FragmentAssembler()
+        self._next_alias_sync = 0.0
 
         self.state = PeerState.STOPPED
         self._retry_at = 0.0
@@ -113,6 +124,8 @@ class FNEPeer:
             'last_error': None,
             'reconnects': 0,
             'metadata_port': None,
+            'radio_aliases': 0,
+            'aliases_synced': None,
             'active_talkgroups': [],
             'rx_frames': {},
             'last_call': None,
@@ -152,10 +165,12 @@ class FNEPeer:
         return dict(self.status)
 
     def send(self, func: int, subfunc: int, payload: bytes, stream_id: Optional[int] = None,
-             seq: int = p.END_OF_CALL_SEQ) -> bool:
-        """Send one message to the FNE. Safe to call from other threads (this
-        is what a voice page transmitter will use)."""
-        if self._sock is None or self._master_addr is None:
+             seq: int = p.END_OF_CALL_SEQ, metadata: bool = False) -> bool:
+        """Send one message to the FNE (its metadata port, traffic port + 1, if
+        metadata). Safe to call from other threads (this is what a voice page
+        transmitter will use)."""
+        addr = self._metadata_addr if metadata else self._master_addr
+        if self._sock is None or addr is None:
             return False
         datagram = p.encode_frame(payload, func, subfunc,
                                   stream_id if stream_id is not None else self.new_stream_id(),
@@ -164,12 +179,25 @@ class FNEPeer:
             datagram = self._cipher.wrap(datagram)
         try:
             with self._send_lock:
-                self._sock.sendto(datagram, self._master_addr)
+                self._sock.sendto(datagram, addr)
         except OSError as e:
             logger.warning(f"DVM peer send failed: {e}")
             return False
         self._last_tx = self._clock()
         return True
+
+    def alias(self, rid) -> Optional[str]:
+        """The radio's alias from the FNE's alias table, or None."""
+        try:
+            rid = int(rid)
+        except (TypeError, ValueError):
+            return None
+        with self._alias_lock:
+            return self._aliases.get(rid)
+
+    def aliases(self) -> Dict[int, str]:
+        with self._alias_lock:
+            return dict(self._aliases)
 
     def new_stream_id(self) -> int:
         return self._rng.randint(0x00000001, 0xFFFFFFFE)
@@ -230,6 +258,7 @@ class FNEPeer:
                 pass
         self._sock = sock
         self._master_addr = sockaddr
+        self._metadata_addr = (sockaddr[0], sockaddr[1] + 1) + tuple(sockaddr[2:])
         self._talkgroups.clear()
         self.status['active_talkgroups'] = []
         self._send_login()
@@ -266,6 +295,8 @@ class FNEPeer:
                 self._last_ping = now
                 self._ping_sent_at = now
                 self.send(Func.PING, p.SUBFUNC_NOP, p.SINGLE_BYTE)
+            if self.alias_interval and now >= self._next_alias_sync:
+                self._request_aliases(now)
 
         for stream_id, last in list(self._call_last_frame.items()):
             if now - last > CALL_IDLE_TIMEOUT:
@@ -333,6 +364,7 @@ class FNEPeer:
             Func.MASTER: self._on_master,
             Func.PROTOCOL: self._on_protocol,
             Func.INCALL_CTRL: self._on_incall_ctrl,
+            Func.RADIO_ALIAS_SYNC: self._on_alias_sync,
         }.get(frame.func)
         if handler:
             handler(frame)
@@ -365,8 +397,44 @@ class FNEPeer:
                 'metadata_port': bool(p.ack_flags(frame.payload) & 0x80),
             })
             self._set_state(PeerState.RUNNING)
+            self._next_alias_sync = now + ALIAS_FIRST_DELAY
             logger.info(f"DVM peer {self.peer_id} logged in to FNE {self.address}:{self.port} "
                         f"(FNE peer ID {frame.ssrc})")
+
+    # ------------------------------------------------------------------
+    #  Radio aliases (dvmhost MetadataNetwork radioAliasSync)
+    # ------------------------------------------------------------------
+
+    def _request_aliases(self, now: float) -> None:
+        """Ask the FNE's metadata port for its radio alias table. The answer
+        comes back on this socket as fragments with the same stream ID."""
+        self._alias_stream_id = self.new_stream_id()
+        self._alias_frags.clear()
+        self._next_alias_sync = now + ALIAS_RETRY       # pushed out once an answer completes
+        self.send(Func.RADIO_ALIAS_SYNC, p.SUBFUNC_NOP, p.SINGLE_BYTE, self._alias_stream_id,
+                  metadata=True)
+
+    def _on_alias_sync(self, frame: p.Frame) -> None:
+        if frame.subfunc != p.SUBFUNC_NOP or not self._alias_stream_id or frame.stream_id != self._alias_stream_id:
+            return
+        try:
+            data = self._alias_frags.add(frame.payload)
+        except p.FrameError as e:
+            logger.warning(f"DVM peer {self.peer_id}: radio alias sync failed: {e}")
+            self._alias_stream_id = 0
+            return
+        if data is None:
+            return                                      # more fragments to come
+        self._alias_stream_id = 0
+        aliases = p.parse_radio_aliases(data)
+        with self._alias_lock:
+            changed = aliases != self._aliases
+            self._aliases = aliases
+        self._next_alias_sync = self._clock() + self.alias_interval
+        self.status.update(radio_aliases=len(aliases), aliases_synced=_now_iso())
+        if changed:
+            logger.info(f"DVM peer {self.peer_id}: {len(aliases)} radio alias(es) from the FNE")
+        self._publish()
 
     def _on_nak(self, frame: p.Frame) -> None:
         reason = p.nak_reason(frame.payload)

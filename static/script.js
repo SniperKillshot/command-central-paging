@@ -105,7 +105,7 @@ function updateDvm(state) {
 
     const call = dvm.last_call;
     document.getElementById('dvm-call').textContent = call
-        ? `${call.src_id} to TG ${call.dst_id} at ${timeOf(call.started)}${call.active ? ' (in progress)' : ''}`
+        ? `${call.src_alias ? `${call.src_alias} (${call.src_id})` : call.src_id} to TG ${call.dst_id} at ${timeOf(call.started)}${call.active ? ' (in progress)' : ''}`
         : 'none yet';
     document.getElementById('dvm-error').textContent = dvm.last_error || 'none';
 }

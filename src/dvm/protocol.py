@@ -59,6 +59,7 @@ class Func(IntEnum):
     KEY_RSP = 0x7D
     ACK = 0x7E
     NAK = 0x7F
+    RADIO_ALIAS_SYNC = 0x85   # radio alias table (dvmhost r05a06_dev and later)
     TRANSFER = 0x90
     ANNOUNCE = 0x91
     REPL = 0x92
@@ -333,3 +334,96 @@ def parse_p25_header(payload: bytes) -> Optional[P25Header]:
     src = int.from_bytes(payload[5:8], 'big')
     dst = int.from_bytes(payload[8:11], 'big')
     return P25Header(payload[4], src, dst, payload[22])
+
+
+# ---------------------------------------------------------------------------
+#  Fragmented, compressed transfers (dvmhost PacketBuffer) - radio alias sync
+# ---------------------------------------------------------------------------
+
+FRAG_HDR_SIZE = 10
+FRAG_BLOCK_SIZE = 534
+FRAG_SIZE = FRAG_HDR_SIZE + FRAG_BLOCK_SIZE          # every fragment on the wire is this long
+EXT_FRAG_HDR_SIZE = 12
+EXT_FRAG_BLOCK_SIZE = FRAG_SIZE - EXT_FRAG_HDR_SIZE
+MAX_256_COMPRESSED_SIZE = 256 * FRAG_BLOCK_SIZE      # above this the "extended" layout is used
+MAX_FRAGMENT_SIZE = 8192 * 1024
+
+
+class FragmentAssembler:
+    """Reassembles a dvmhost PacketBuffer transfer: fragments of FRAG_SIZE
+    bytes, each with a header of
+
+        0-3  uncompressed length (block 0, or every block when extended)
+        4-7  compressed length   (likewise)
+        8    block number, 9 last block number          (legacy)
+        8-9  block number, 10-11 last block number      (extended: compressed
+                                                         length > 136704)
+
+    then a slice of zlib-compressed data. add() returns the decompressed
+    message once every block is in, else None."""
+
+    def __init__(self):
+        self.clear()
+
+    def clear(self) -> None:
+        self._blocks: Dict[int, bytes] = {}
+        self._last = None
+        self._size = self._csize = 0
+
+    def add(self, frag: bytes) -> Optional[bytes]:
+        import zlib
+        if len(frag) < FRAG_SIZE:
+            raise FrameError(f'fragment too short ({len(frag)} bytes)')
+        size, csize = struct.unpack_from('>II', frag, 0)
+        extended = csize > MAX_256_COMPRESSED_SIZE
+        if extended:
+            block, last = struct.unpack_from('>HH', frag, 8)
+            hdr, bsize = EXT_FRAG_HDR_SIZE, EXT_FRAG_BLOCK_SIZE
+        else:
+            block, last = frag[8], frag[9]
+            hdr, bsize = FRAG_HDR_SIZE, FRAG_BLOCK_SIZE
+        if block > last or (self._last is not None and last != self._last):
+            self.clear()
+            raise FrameError(f'inconsistent fragment {block} of {last + 1}')
+        if block == 0 or extended:
+            if not 0 < size <= MAX_FRAGMENT_SIZE or not 0 < csize <= MAX_FRAGMENT_SIZE:
+                self.clear()
+                raise FrameError('fragment sizes out of range')
+            if -(-csize // bsize) != last + 1:
+                self.clear()
+                raise FrameError('fragment block count does not match its length')
+            self._size, self._csize = size, csize
+        self._last = last
+        self._blocks[block] = bytes(frag[hdr:hdr + bsize])
+        if len(self._blocks) < last + 1 or not self._csize:
+            return None
+        data = b''.join(self._blocks[i] for i in range(last + 1))[:self._csize]
+        expect = self._size
+        self.clear()
+        try:
+            out = zlib.decompress(data)
+        except zlib.error as e:
+            raise FrameError(f'cannot decompress transfer: {e}') from None
+        if len(out) != expect:
+            raise FrameError(f'transfer is {len(out)} bytes, header said {expect}')
+        return out
+
+
+def parse_radio_aliases(text: bytes) -> Dict[int, str]:
+    """dvmhost's radio alias file: "rid,alias" per line, # comments."""
+    out: Dict[int, str] = {}
+    for line in text.decode('utf-8', 'replace').splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        parts = line.split(',')
+        if len(parts) < 2:
+            continue
+        try:
+            rid = int(parts[0].strip())
+        except ValueError:
+            continue
+        alias = parts[1].strip()
+        if alias:
+            out[rid] = alias
+    return out

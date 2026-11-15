@@ -5,6 +5,7 @@ import os
 import signal
 import sys
 
+from src import tls
 from src.audio.tones import SoundLibrary
 from src.audio.tts import TTS
 from src.config import Config
@@ -50,7 +51,8 @@ def main():
     tts_settings = config.get('tts', default={}) or {}
     tts = TTS(tts_settings)
     sounds = SoundLibrary(config.get('sounds_dir', default='sounds'))
-    settings = SettingsStore(os.path.join(config.get('data_dir', default='data'), 'settings.json'),
+    data_dir = config.get('data_dir', default='data')
+    settings = SettingsStore(os.path.join(data_dir, 'settings.json'),
                              {'tts': tts_settings.get('default') or {}})
 
     dvm_peer = None
@@ -108,10 +110,24 @@ def main():
     services = Services(dispatcher=dispatcher, destinations=destinations, tts=tts,
                         sounds=sounds, settings=settings, pager=pager, console=console,
                         rx_audio=rx_audio)
-    app = create_app(on_status=on_status, push_token=config.get('forewarned', 'push_token', default=''),
-                     services=services, api_token=config.get('web', 'api_token', default=''))
     host = config.get('web', 'host', default='0.0.0.0')
     port = config.get('web', 'port', default=5000)
+    # HTTPS alongside, so another PC's browser can use its microphone
+    https_port = int(config.get('web', 'https_port', default=0) or 0)
+    ssl_context = ca_cert = None
+    if https_port:
+        try:
+            ssl_context, ca_cert = tls.setup(config.get('web', default={}) or {}, data_dir)
+        except Exception as e:
+            logger.error(f"HTTPS not started: {e}")
+            https_port = 0
+    app = create_app(on_status=on_status, push_token=config.get('forewarned', 'push_token', default=''),
+                     services=services, api_token=config.get('web', 'api_token', default=''),
+                     https_port=https_port, ca_cert=ca_cert)
+    if https_port:
+        tls.serve(app, host, https_port, ssl_context)
+        logger.info(f"HTTPS on https://{host}:{https_port}/"
+                    + (f" (trust its CA from http://<this host>:{port}/ca.crt)" if ca_cert else ''))
     logger.info(f"Dashboard on http://{host}:{port}/ (dispatch console: /dispatch)")
     app.run(
         host=host,

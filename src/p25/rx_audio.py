@@ -1,10 +1,11 @@
 """Decode P25 calls heard from the FNE and fan the audio out to listeners.
 
-The FNE peer hands every P25 network frame to `RxAudio.on_p25`. While at
-least one dispatch console is listening, LDU1/LDU2 frames are queued to a
-worker thread that IMBE-decodes them (one decoder per call) into 180 ms
-chunks of 8 kHz audio. Each listener gets its own bounded queue, so a slow
-browser drops audio instead of holding anything up.
+The FNE peer hands every P25 network frame to `RxAudio.on_p25`. Calls on a
+talkgroup some dispatch console is listening to have their LDU1/LDU2 frames
+queued to a worker thread that IMBE-decodes them (one decoder per call) into
+180 ms chunks of 8 kHz audio; other calls aren't decoded at all. Each
+listener names its talkgroups (its unmuted tiles) and gets its own bounded
+queue, so a slow browser drops audio instead of holding anything up.
 
 Encrypted calls are decrypted when a configured key matches their algorithm
 and key ID (src/p25/crypto.py); without one they are reported, not played.
@@ -21,7 +22,7 @@ import logging
 import queue
 import struct
 import threading
-from typing import Dict, Optional
+from typing import Dict, FrozenSet, Iterable, Optional, Tuple
 
 import numpy as np
 
@@ -72,7 +73,9 @@ def _clear(algo: int) -> bool:
 class RxAudio:
     def __init__(self, keys: Optional[KeyStore] = None):
         self.keys = keys if keys is not None else KeyStore()
-        self._listeners: Dict[int, queue.Queue] = {}
+        # listener id -> (queue, its talkgroups, or None for every talkgroup)
+        self._listeners: Dict[int, Tuple[queue.Queue, Optional[FrozenSet[int]]]] = {}
+        self._wanted: Optional[FrozenSet[int]] = frozenset()   # all listeners' talkgroups together
         self._next_id = 0
         self._lock = threading.Lock()
         self._work: queue.Queue = queue.Queue(maxsize=500)
@@ -82,25 +85,38 @@ class RxAudio:
 
     # -- listeners ----------------------------------------------------------
 
-    def listen(self):
-        """Register a listener; returns (id, queue of message bytes)."""
+    def listen(self, talkgroups: Optional[Iterable[int]] = None):
+        """Register a listener for these talkgroups (None: all of them);
+        returns (id, queue of message bytes)."""
         q: queue.Queue = queue.Queue(maxsize=LISTENER_QUEUE)
+        tgs = None if talkgroups is None else frozenset(talkgroups)
         with self._lock:
             self._next_id += 1
-            self._listeners[self._next_id] = q
+            self._listeners[self._next_id] = (q, tgs)
+            self._update_wanted()
             return self._next_id, q
 
     def unlisten(self, listener_id: int) -> None:
         with self._lock:
             self._listeners.pop(listener_id, None)
+            self._update_wanted()
+
+    def _update_wanted(self) -> None:
+        tgs = [t for _, t in self._listeners.values()]
+        self._wanted = None if None in tgs else frozenset().union(*tgs)
+
+    def wants(self, tgid: int) -> bool:
+        """Whether any listener is listening to this talkgroup."""
+        wanted = self._wanted
+        return wanted is None or tgid in wanted
 
     @property
     def listening(self) -> int:
         return len(self._listeners)
 
-    def _publish(self, data: bytes) -> None:
+    def _publish(self, tgid: int, data: bytes) -> None:
         with self._lock:
-            targets = list(self._listeners.values())
+            targets = [q for q, tgs in self._listeners.values() if tgs is None or tgid in tgs]
         for q in targets:
             try:
                 q.put_nowait(data)
@@ -111,7 +127,7 @@ class RxAudio:
 
     def on_p25(self, stream_id: int, hdr, payload: bytes) -> None:
         """Called on the FNE peer's thread for every P25 frame; never blocks."""
-        if not self._listeners and stream_id not in self._calls:
+        if stream_id not in self._calls and not self.wants(hdr.dst_id):
             return
         if hdr.duid in (DUID_LDU1, DUID_LDU2, DUID_TDU, DUID_TDULC):
             try:
@@ -133,15 +149,15 @@ class RxAudio:
         if hdr.duid in (DUID_TDU, DUID_TDULC):
             if call:
                 del self._calls[stream_id]
-                self._publish(message(MSG_END, call.tgid, call.src, stream_id))
+                self._publish(call.tgid, message(MSG_END, call.tgid, call.src, stream_id))
             return
         if call is None:
-            if not self._listeners:
+            if not self.wants(hdr.dst_id):
                 return
             call = self._calls[stream_id] = _Call(hdr.dst_id, hdr.src_id)
             if len(self._calls) > 32:                     # calls that never sent a TDU
                 self._calls.pop(next(iter(self._calls)))
-        if call.encrypted or len(payload) < LDU_VOICE_END:
+        if call.encrypted or len(payload) < LDU_VOICE_END or not self.wants(call.tgid):
             return
         ldu1 = hdr.duid == DUID_LDU1
         sync = ldu1_header_sync(payload) if ldu1 else ldu2_sync(payload)
@@ -153,7 +169,7 @@ class RxAudio:
             key = self.keys.key(algo, kid)
             if key is None:
                 call.encrypted = True
-                self._publish(message(MSG_ENCRYPTED, call.tgid, call.src, stream_id))
+                self._publish(call.tgid, message(MSG_ENCRYPTED, call.tgid, call.src, stream_id))
                 return
             call.decryptor = CallDecryptor(algo, kid, key)
             logger.info(f"RX: TG {call.tgid} from {call.src} is {ALGO_NAMES.get(algo, hex(algo))} "
@@ -165,5 +181,5 @@ class RxAudio:
                 return                  # not in sync yet (waiting for an MI)
         pcm = np.concatenate([call.decoder.decode(f) for f in imbe])
         pcm = np.clip(np.round(pcm * call.decoder.gain), -32768, 32767)
-        self._publish(message(MSG_AUDIO, call.tgid, call.src, stream_id, pcm,
-                              FLAG_DECRYPTED if call.decryptor else 0))
+        self._publish(call.tgid, message(MSG_AUDIO, call.tgid, call.src, stream_id, pcm,
+                                         FLAG_DECRYPTED if call.decryptor else 0))

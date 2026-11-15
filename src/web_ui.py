@@ -1,13 +1,14 @@
 """Flask web application: dashboard + REST API."""
 import hmac
 import logging
+import os
 import queue
 from dataclasses import dataclass
 from datetime import datetime
 from functools import wraps
 from typing import Any, Callable, Dict, Optional
 
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request, send_file
 
 from src.p25.live import LiveError
 from src.p25.rx_audio import MSG_KEEPALIVE, message as rx_message
@@ -38,7 +39,7 @@ class Services:
 
 def create_app(on_status: Optional[Callable[[Dict[str, Any]], int]] = None,
                push_token: str = '', services: Optional[Services] = None,
-               api_token: str = '') -> Flask:
+               api_token: str = '', https_port: int = 0, ca_cert: Optional[str] = None) -> Flask:
     app = Flask(__name__, template_folder='../templates', static_folder='../static')
     app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024    # a minute of 96 kHz mic audio
     svc = services or Services()
@@ -63,6 +64,15 @@ def create_app(on_status: Optional[Callable[[Dict[str, Any]], int]] = None,
     @app.route('/health')
     def health():
         return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
+
+    @app.route('/ca.crt')
+    def ca_certificate():
+        """The local CA behind the HTTPS port (src/tls.py), to install as
+        trusted on a PC that talks. A certificate only - nothing secret."""
+        if not ca_cert:
+            return jsonify({'error': 'no local CA (HTTPS off, or using a certificate of your own)'}), 404
+        return send_file(os.path.abspath(ca_cert), mimetype='application/x-x509-ca-cert',
+                         as_attachment=True, download_name='command-central-paging-ca.crt')
 
     @app.route('/api/state')
     def api_state():
@@ -190,6 +200,7 @@ def create_app(on_status: Optional[Callable[[Dict[str, Any]], int]] = None,
         state = svc.console.state()
         state['api_token_required'] = bool(api_token)
         state['listen_available'] = svc.rx_audio is not None
+        state['https_port'] = https_port
         return jsonify(state)
 
     @app.route('/api/dispatch/page', methods=['POST'])
@@ -253,13 +264,17 @@ def create_app(on_status: Optional[Callable[[Dict[str, Any]], int]] = None,
     @app.route('/api/dispatch/listen')
     def api_dispatch_listen():
         """Audio of calls heard from the FNE, streamed as binary messages for as
-        long as the client stays connected (format: src/p25/rx_audio.py)."""
+        long as the client stays connected (format: src/p25/rx_audio.py).
+        ?tg=500,501 limits it to those talkgroups (the console's unmuted tiles;
+        empty = none); without it, every talkgroup."""
         if svc.rx_audio is None:
             return jsonify({'error': 'no FNE connection to listen to'}), 503
         rx = svc.rx_audio
+        tg = request.args.get('tg')
+        talkgroups = None if tg is None else {int(t) for t in tg.split(',') if t.strip().isdigit()}
 
         def stream():
-            listener, q = rx.listen()
+            listener, q = rx.listen(talkgroups)
             try:
                 yield rx_keepalive()
                 while True:

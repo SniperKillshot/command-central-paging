@@ -276,7 +276,8 @@ touchscreen but usable with a mouse and keyboard:
   destinations, and whatever the FNE reports active) showing RX (who is
   talking, and for how long), TX, queued pages, encrypted calls, and when it
   was last heard or paged. Tap tiles to select them; several can be selected.
-- **Listen**: turns on audio of calls heard from the FNE. The speaker button
+- **Listen**: turns on audio of calls heard on the tiles' talkgroups (nothing
+  else is played, or even decoded). The speaker button
   on each tile mutes or unmutes that talkgroup; calls on different
   talkgroups play mixed together. Encrypted calls play if their key is
   configured (the badge shows "RX 🔒"); without it they show as ENC and
@@ -297,9 +298,33 @@ by every console from then on, in place of `dispatch:` in config.yaml;
 Keys: `1`-`0` select tiles, hold `Space` to talk, `Esc` clears the
 selection, `L` toggles listening.
 
-Browsers only allow the microphone on `localhost` or over HTTPS, so live talk
-works on the machine running the service, or elsewhere once it is behind an
-HTTPS reverse proxy. Listening, tones and messages work from anywhere.
+Browsers only allow the microphone on `localhost` or over HTTPS. Listening,
+tones and messages work from anywhere; live talk from another PC goes over
+the service's HTTPS port.
+
+### HTTPS for live talk
+
+The service also serves HTTPS on `web.https_port` (5443). On first start it
+makes its own small certificate authority and a certificate for the
+machine's hostname and every address it has (LAN, NetBird, ...), kept in
+`data/tls/`. Trust that CA once on each PC that talks:
+
+1. Download `http://<paging host>:5000/ca.crt`.
+2. **Windows** (Chrome and Edge): open the file, *Install Certificate* →
+   *Current User* → *Place all certificates in the following store* →
+   *Trusted Root Certification Authorities*. Restart the browser.
+   **Firefox** has its own list: *Settings → Privacy & Security →
+   Certificates → View Certificates → Authorities → Import*, tick
+   "trust this CA to identify websites".
+3. Open `https://<paging host>:5443/dispatch` (the address must be one the
+   certificate covers - the startup log lists them).
+
+If the machine's addresses change, the certificate is reissued from the same
+CA on the next start, so nothing needs reinstalling. Add other names (a DNS
+name for it) under `web.https_names`, or point `web.https_cert`/`https_key`
+at a certificate of your own. Without the CA installed the browser shows a
+certificate warning first; clicking through usually still allows the
+microphone, but the browser may not remember that permission.
 
 ### Screen options
 
@@ -312,6 +337,11 @@ the same service can drive a listen-only touchscreen and a talking PC:
 | `/dispatch?listen=on` | Starts listening when the page loads, ignoring the remembered on/off. Browsers block sound until the screen is first tapped, unless they are started with `--autoplay-policy=no-user-gesture-required` (see the kiosk setup below). |
 
 Use both together: `/dispatch?talk=off&listen=on`.
+
+The **Paging** button in the top bar collapses the paging panel (talk button,
+tones, spoken messages) so the tiles take the whole width, for a screen that
+only monitors. Each browser remembers it. `Space` doesn't talk while the panel
+is hidden.
 
 ### Running as a service (Alpine / OpenRC)
 

@@ -107,6 +107,28 @@ class RxAudioTests(unittest.TestCase):
         msgs = read_messages(q, MSG_END)
         self.assertEqual([m[0] for m in msgs], [MSG_ENCRYPTED, MSG_END])
 
+    def test_only_listened_talkgroups(self):
+        _, ops = self.rx.listen({1001})
+        _, fire = self.rx.listen({2002, 3003})
+        self.feed_call(50, F.CallParams(src_id=5, dst_id=4004), self.frames)      # nobody's
+        self.feed_call(51, F.CallParams(src_id=6, dst_id=2002), self.frames)
+        msgs = read_messages(fire, MSG_END)
+        self.assertEqual({m[1] for m in msgs}, {2002})
+        self.assertEqual([m[0] for m in msgs][-1], MSG_END)
+        self.assertTrue(ops.empty())
+        self.assertEqual(self.rx._calls, {})          # 4004 was never decoded
+
+    def test_no_talkgroups_hears_nothing(self):
+        lid, q = self.rx.listen(set())
+        self.assertFalse(self.rx.wants(1001))
+        self.feed_call(52, F.CallParams(src_id=5, dst_id=1001), self.frames)
+        time.sleep(0.3)
+        self.assertTrue(q.empty())
+        self.assertEqual(self.rx._calls, {})
+        self.rx.listen()                             # None: everything
+        self.assertTrue(self.rx.wants(4004))
+        self.rx.unlisten(lid)
+
 
 class LiveTalkTests(unittest.TestCase):
     def setUp(self):
@@ -237,6 +259,17 @@ class LiveApiTests(unittest.TestCase):
         self.assertEqual(self.rx.listening, 1)
         resp.close()
         self.assertEqual(self.rx.listening, 0)
+
+    def test_listen_stream_talkgroups(self):
+        resp = self.client.get('/api/dispatch/listen?tg=1001,2002', buffered=False)
+        next(iter(resp.response))                                  # keepalive: registered
+        self.assertTrue(self.rx.wants(1001) and self.rx.wants(2002))
+        self.assertFalse(self.rx.wants(3003))
+        resp.close()
+        resp = self.client.get('/api/dispatch/listen?tg=', buffered=False)
+        next(iter(resp.response))
+        self.assertFalse(self.rx.wants(1001))
+        resp.close()
 
 
 if __name__ == '__main__':

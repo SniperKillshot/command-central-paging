@@ -303,6 +303,7 @@ async function refresh() {
         renderTiles();
         renderSelection();
         renderActivity();
+        updateListenTalkgroups();
     } catch (e) {
         $('fne').className = 'pill pill-down';
         $('fne-text').textContent = 'Server unreachable';
@@ -367,6 +368,8 @@ const rxAudio = {
     decrypted: new Set(),        // stream IDs: encrypted on air, decrypted by the server
     muted: new Set(store('ccpMuted') || []),
     ducked: false,
+    talkgroups: null,            // what the current stream was asked for ("500,501")
+    restart: false,              // reconnecting for a new set of talkgroups
 
     hearing(tgid) {
         if (!this.ctx) return false;
@@ -380,6 +383,23 @@ function toggleMonitor(tgid) {
     if (rxAudio.muted.has(tgid)) rxAudio.muted.delete(tgid); else rxAudio.muted.add(tgid);
     store('ccpMuted', [...rxAudio.muted]);
     if (state) renderTiles();
+    updateListenTalkgroups();
+}
+
+// Only the tiles' talkgroups are heard, less the muted ones.
+function heard(tgid) {
+    return tileEls.has(tgid) && !rxAudio.muted.has(tgid);
+}
+
+function listenTalkgroups() {
+    return state ? state.talkgroups.map(t => t.tgid).filter(heard).join(',') : '';
+}
+
+// Tiles or mutes changed: ask the server for the new set, straight away.
+function updateListenTalkgroups() {
+    if (!rxAudio.on || rxAudio.talkgroups === null || listenTalkgroups() === rxAudio.talkgroups) return;
+    rxAudio.restart = true;
+    if (rxAudio.abort) rxAudio.abort.abort();
 }
 
 function setVolume() {
@@ -417,6 +437,7 @@ async function startListening() {
 
 function stopListening() {
     rxAudio.on = false;
+    rxAudio.talkgroups = null;
     store('ccpListen', false);
     if (rxAudio.abort) rxAudio.abort.abort();
     rxAudio.streams.clear();
@@ -427,8 +448,11 @@ function stopListening() {
 async function listenLoop() {
     while (rxAudio.on) {
         rxAudio.abort = new AbortController();
+        rxAudio.restart = false;
+        rxAudio.talkgroups = listenTalkgroups();
         try {
-            const r = await fetch('/api/dispatch/listen', { signal: rxAudio.abort.signal, cache: 'no-store' });
+            const r = await fetch(`/api/dispatch/listen?tg=${rxAudio.talkgroups}`,
+                                  { signal: rxAudio.abort.signal, cache: 'no-store' });
             if (!r.ok) throw new Error(`HTTP ${r.status}`);
             renderListen();
             await readStream(r.body.getReader());
@@ -436,6 +460,7 @@ async function listenLoop() {
             if (!rxAudio.on) return;
         }
         if (!rxAudio.on) return;
+        if (rxAudio.restart) continue;
         renderListen('Reconnecting');
         await new Promise(res => setTimeout(res, 2000));
     }
@@ -476,7 +501,7 @@ async function readStream(reader) {
 
 function playChunk(tgid, stream, pcm) {
     const ctx = rxAudio.ctx;
-    if (!ctx || rxAudio.muted.has(tgid)) return;
+    if (!ctx || !heard(tgid)) return;
     const audio = ctx.createBuffer(1, pcm.length, 8000);
     const ch = audio.getChannelData(0);
     for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
@@ -581,7 +606,9 @@ function setPttIdle() {
     $('ptt-level').style.width = '0';
     if (!micSupported()) {
         b.disabled = true;
-        setPtt('TALK UNAVAILABLE', 'The microphone needs HTTPS, or open this page on the console PC itself (localhost)');
+        setPtt('TALK UNAVAILABLE', state && state.https_port && location.protocol === 'http:'
+            ? `The microphone needs HTTPS: open https://${location.hostname}:${state.https_port}/dispatch`
+            : 'The microphone needs HTTPS, or open this page on the console PC itself (localhost)');
         return;
     }
     if (state && !state.live_available) {
@@ -758,7 +785,7 @@ function setupKeys() {
         if (editorOpen() || typing(e) || e.ctrlKey || e.altKey || e.metaKey) return;
         if (e.code === 'Space') {
             e.preventDefault();             // no page scroll / button click
-            if (!e.repeat && TALK) pttDown();
+            if (!e.repeat && TALK && !controlsHidden()) pttDown();     // never talk with the button out of sight
         } else if (/^Digit[0-9]$/.test(e.code) && state) {
             const n = Number(e.code.slice(5));
             const t = state.talkgroups[n === 0 ? 9 : n - 1];
@@ -779,6 +806,30 @@ function setupKeys() {
     $('message').addEventListener('keydown', e => {
         if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
         if (e.key === 'Escape') e.target.blur();
+    });
+}
+
+// ---------------------------------------------------------------------------
+//  Paging panel: collapsible, so a monitoring screen can give the tiles the
+//  whole width. Remembered per browser.
+// ---------------------------------------------------------------------------
+
+function controlsHidden() {
+    return document.body.classList.contains('controls-hidden');
+}
+
+function showControls(show) {
+    document.body.classList.toggle('controls-hidden', !show);
+    $('controls-toggle').setAttribute('aria-expanded', String(show));
+}
+
+function setupControlsToggle() {
+    showControls(!store('ccpControlsHidden'));
+    $('controls-toggle').addEventListener('click', () => {
+        const show = controlsHidden();
+        if (!show && talk.held) pttUp();
+        showControls(show);
+        store('ccpControlsHidden', !show);
     });
 }
 
@@ -1045,6 +1096,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     setupPtt();
     setupKeys();
+    setupControlsToggle();
     setupEditor();
     tick();
     refresh();

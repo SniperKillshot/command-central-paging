@@ -9,7 +9,7 @@
 </head>
 <body>
     <header class="topbar">
-        <a class="top-link" href="/" title="Back to the dashboard">&#8592; Dashboard</a>
+        <a class="top-link" href="/" title="Back to the dashboard">&#8592;<span class="top-link-text">Dashboard</span></a>
         <h1>Dispatch</h1>
         <div class="listen-box">
             <button id="listen" class="listen-btn" aria-pressed="false" title="Hear calls on the monitored talkgroups">
@@ -20,6 +20,7 @@
         </div>
         <div id="fne" class="pill pill-off"><span class="dot"></span><span id="fne-text">FNE</span></div>
         <div id="alert" class="pill alert-none">Alert: NONE</div>
+        <button id="controls-toggle" class="top-link edit-open controls-toggle" aria-controls="controls" aria-expanded="true" title="Hide or show the paging and talk panel">Paging</button>
         <button id="edit-open" class="top-link edit-open" title="Add, remove, rename and reorder tiles">Edit tiles</button>
         <div id="clock" class="clock">--:--:--</div>
     </header>
@@ -33,7 +34,7 @@
             </div>
         </section>
 
-        <aside class="controls" aria-label="Paging controls">
+        <aside id="controls" class="controls" aria-label="Paging controls">
             <div class="selection">
                 <div class="selection-head">
                     <span class="label">Selected</span>

@@ -222,3 +222,11 @@ web:
   # If set, sending pages and changing the voice need this token (header
   # X-Api-Token; the dashboard asks for it once). env override: WEB_API_TOKEN
   api_token: ""
+  # HTTPS as well, so a browser on another PC can use its microphone for live
+  # talk. The first start makes a local CA (data_dir/tls/ca.crt) and a
+  # certificate for this machine's names and addresses; install the CA as
+  # trusted on each PC that talks (download it from http://<host>:5000/ca.crt).
+  https_port: 5443           # 0 = off
+  https_names: []            # extra names/addresses for the certificate, e.g. [paging.lan]
+  https_cert: ""             # or use a certificate of your own (PEM files)
+  https_key: ""

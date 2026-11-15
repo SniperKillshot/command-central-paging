@@ -95,6 +95,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         'host': '0.0.0.0',
         'port': 5000,
         'api_token': '',
+        'https_port': 5443,          # 0 = off; see src/tls.py
+        'https_names': [],           # extra hostnames/IPs for the certificate
+        'https_cert': '',            # a certificate of your own instead (PEM paths)
+        'https_key': '',
     },
 }
 

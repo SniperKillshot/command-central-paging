@@ -2,6 +2,8 @@
 import atexit
 import logging
 import os
+import signal
+import sys
 
 from src.audio.tones import SoundLibrary
 from src.audio.tts import TTS
@@ -24,6 +26,13 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+# One line per HTTP request is a lot: every open console polls once a second.
+# CCP_ACCESS_LOG=1 brings it back.
+if os.environ.get('CCP_ACCESS_LOG', '').strip() in ('', '0'):
+    logging.getLogger('werkzeug').setLevel(logging.WARNING)
+# A service manager stops us with SIGTERM: exit normally so the atexit
+# handlers run (the FNE is told we're leaving).
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
 
 def main():
@@ -85,9 +94,12 @@ def main():
                         rx_audio=rx_audio)
     app = create_app(on_status=on_status, push_token=config.get('forewarned', 'push_token', default=''),
                      services=services, api_token=config.get('web', 'api_token', default=''))
+    host = config.get('web', 'host', default='0.0.0.0')
+    port = config.get('web', 'port', default=5000)
+    logger.info(f"Dashboard on http://{host}:{port}/ (dispatch console: /dispatch)")
     app.run(
-        host=config.get('web', 'host', default='0.0.0.0'),
-        port=config.get('web', 'port', default=5000),
+        host=host,
+        port=port,
         debug=False,
         threaded=True,
     )

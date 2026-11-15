@@ -1,0 +1,49 @@
+#!/sbin/openrc-run
+# Command Central Paging - OpenRC service (Alpine).
+#
+# Install:
+#   doas install -m 755 deploy/openrc/ccpaging /etc/init.d/ccpaging
+#   doas install -m 644 deploy/openrc/ccpaging.confd /etc/conf.d/ccpaging
+#   doas rc-update add ccpaging default
+#   doas rc-service ccpaging start
+#
+# Settings (user, folder, log file) are in /etc/conf.d/ccpaging.
+
+name="Command Central Paging"
+description="Alert and P25 paging dashboard, dispatch console and DVM FNE peer"
+
+: ${CCP_USER:=pagingterm}
+: ${CCP_DIR:=/home/${CCP_USER}/command-central-paging}
+: ${CCP_LOG:=/var/log/ccpaging.log}
+: ${CCP_PYTHON:=/usr/bin/python3}
+
+supervisor="supervise-daemon"
+command="${CCP_PYTHON}"
+command_args="main.py"
+command_user="${CCP_USER}"
+directory="${CCP_DIR}"
+output_log="${CCP_LOG}"
+error_log="${CCP_LOG}"
+# restart after a crash, 5 s apart; give up after 10 crashes in 10 minutes
+respawn_delay=5
+respawn_max=10
+respawn_period=600
+# SIGTERM lets the app tell the FNE it is leaving; kill it if that hangs
+retry="TERM/15/KILL/5"
+
+export PYTHONUNBUFFERED=1
+
+depend() {
+	need net
+	use dns
+	# the FNE is reached over NetBird; the app retries until it is up
+	after netbird
+}
+
+start_pre() {
+	checkpath -f -o "${CCP_USER}" -m 0640 "${CCP_LOG}"
+	if [ ! -f "${CCP_DIR}/config.yaml" ]; then
+		eerror "${CCP_DIR}/config.yaml not found"
+		return 1
+	fi
+}

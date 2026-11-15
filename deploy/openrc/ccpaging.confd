@@ -1,0 +1,12 @@
+# /etc/conf.d/ccpaging - settings for the Command Central Paging service.
+
+# User the service runs as, and the folder holding main.py and config.yaml.
+#CCP_USER="pagingterm"
+#CCP_DIR="/home/pagingterm/command-central-paging"
+
+# Where the app's log goes (rotate it with logrotate if it grows).
+#CCP_LOG="/var/log/ccpaging.log"
+
+# Environment for the app, for example:
+#export CCP_ACCESS_LOG=1           # log every HTTP request
+#export CCP_PURE_PYTHON_IMBE=1     # force the pure Python vocoder

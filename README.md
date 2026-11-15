@@ -182,7 +182,7 @@ with "Desktop development with C++"). The crate is vendored in
 there), so the build needs no internet. Build on the machine that runs the service - the library is
 platform-specific and not committed - and rebuild after pulling a change to
 `src/p25/native/blip25`. The build uses only baseline x86-64 instructions,
-so it suits older CPUs such as the Barco CSC-1's AMD G-T65N.
+so it suits older CPUs such as the Barco CSC-1's AMD G-T56N.
 
 Without it, the pure Python encoder and decoder are used. They work anywhere
 but are not reference-exact and are slow: live talk needs a fast PC, and
@@ -260,6 +260,30 @@ the same service can drive a listen-only touchscreen and a talking PC:
 
 Use both together: `/dispatch?talk=off&listen=on`.
 
+### Running as a service (Alpine / OpenRC)
+
+`deploy/openrc/ccpaging` runs the app at boot as an ordinary user, from its
+git checkout, restarting it if it crashes. From the checkout:
+
+```sh
+doas install -m 755 deploy/openrc/ccpaging /etc/init.d/ccpaging
+doas install -m 644 deploy/openrc/ccpaging.confd /etc/conf.d/ccpaging
+doas rc-update add ccpaging default
+doas rc-service ccpaging start
+rc-service ccpaging status
+tail -f /var/log/ccpaging.log
+```
+
+It runs as `pagingterm` from `~pagingterm/command-central-paging` by default;
+change `CCP_USER` / `CCP_DIR` in `/etc/conf.d/ccpaging`. It starts after
+`netbird` if that service exists (the FNE connection retries until the VPN is
+up). Stopping it sends SIGTERM, which logs out of the FNE cleanly. HTTP
+requests aren't logged (each open console polls every second); set
+`CCP_ACCESS_LOG=1` in the conf.d file to log them.
+
+To update: `git pull`, rebuild blip25 if `src/p25/native/blip25` changed
+(`python3 tools/build_native.py`), then `doas rc-service ccpaging restart`.
+
 ### Host touchscreen (Alpine kiosk)
 
 To have the machine running the service boot straight into a full-screen,
@@ -278,8 +302,8 @@ alsamixer            # unmute the output (M) and set the level, then:
 alsactl store
 ```
 
-`xf86-video-ati` and `linux-firmware-radeon` are for the CSC-1's AMD G-T65N
-(Radeon HD 6250); on other hardware use that machine's graphics driver.
+`xf86-video-ati` and `linux-firmware-radeon` are for the CSC-1's AMD G-T56N
+(Radeon HD 6320); on other hardware use that machine's graphics driver.
 
 Log `kiosk` in automatically on the console: in `/etc/inittab`, replace the
 `tty1::respawn:/sbin/getty 38400 tty1` line with:
@@ -308,7 +332,8 @@ exec chromium-browser --kiosk --noerrdialogs --disable-infobars --no-first-run \
     'http://localhost:5000/dispatch?talk=off&listen=on'
 ```
 
-Then `reboot`. The paging service has to start at boot as well. Notes:
+Then `reboot`. The paging service has to start at boot as well (see
+[Running as a service](#running-as-a-service-alpine--openrc)). Notes:
 
 - **Exiting the kiosk:** use `Ctrl+Alt+F2` for a text login, or
   `Alt+F4` to close Chromium, which drops back to the login.

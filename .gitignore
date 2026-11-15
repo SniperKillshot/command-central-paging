@@ -7,5 +7,7 @@ config.yaml
 data/
 voices/
 
-# compiled IMBE encoder (python tools/build_native.py)
+# compiled blip25 vocoder (python tools/build_native.py)
+src/p25/native/_blip25.*
 src/p25/native/_imbe.*
+src/p25/native/blip25/target/

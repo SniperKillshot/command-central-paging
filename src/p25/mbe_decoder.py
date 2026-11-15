@@ -9,9 +9,10 @@ page will actually sound on a radio.
 Float arithmetic (numpy float64 rather than C float), so output is close to,
 not bit-identical with, mbelib - fine for both uses.
 
-src/p25/native/imbe_dec.c is the same decoder in C; IMBEDecoder below is
-that one when it has been built (python tools/build_native.py), and
-PyIMBEDecoder otherwise.
+IMBEDecoder below is the blip25 decoder (src/p25/blip25.py, bit-exact with
+the DVSI reference vocoder) when it has been built with
+python tools/build_native.py, and PyIMBEDecoder otherwise. Decoders say how
+to scale their output to int16 PCM in `gain`.
 """
 import math
 import os
@@ -62,6 +63,7 @@ def _bin(bits) -> int:
 
 class PyIMBEDecoder:
     native = False
+    gain = 7.0                  # mbelib's own float-to-short scaling
 
     def __init__(self, uvquality: int = 3, seed: Optional[int] = None):
         self.uvquality = uvquality
@@ -299,16 +301,15 @@ class PyIMBEDecoder:
 def _choose_decoder():
     if os.environ.get('CCP_PURE_PYTHON_IMBE', '').strip() not in ('', '0'):
         return PyIMBEDecoder
-    from src.p25 import imbe_native
-    return imbe_native.NativeIMBEDecoder if imbe_native.available() else PyIMBEDecoder
+    from src.p25 import blip25
+    return blip25.Blip25Decoder if blip25.available() else PyIMBEDecoder
 
 
 IMBEDecoder = _choose_decoder()
 
 
-def decode_to_pcm(frames, gain: float = 7.0) -> np.ndarray:
-    """Decode a sequence of IMBE frames to int16 PCM at 8 kHz. gain=7 matches
-    mbelib's own float-to-short scaling."""
+def decode_to_pcm(frames) -> np.ndarray:
+    """Decode a sequence of IMBE frames to int16 PCM at 8 kHz."""
     dec = IMBEDecoder(seed=1)
     pcm = np.concatenate([dec.decode(f) for f in frames]) if frames else np.zeros(0)
-    return np.clip(pcm * gain, -32760, 32760).astype(np.int16)
+    return np.clip(np.round(pcm * dec.gain), -32768, 32767).astype(np.int16)

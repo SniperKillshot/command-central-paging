@@ -45,9 +45,9 @@ def main():
     print(f"Python {sys.version.split()[0]}, numpy {np.__version__}")
     for what, cls in (('Encoder', IMBEEncoder), ('Decoder', IMBEDecoder)):
         if getattr(cls, 'native', False):
-            print(f"{what}: compiled (src/p25/native)")
+            print(f"{what}: blip25 (src/p25/native)")
         else:
-            print(f"{what}: pure Python - build the compiled one with: python tools/build_native.py")
+            print(f"{what}: pure Python - build blip25 with: python tools/build_native.py")
     print(f"Encode: {enc_ms:6.1f} ms/frame  ({REALTIME_MS / enc_ms:4.1f}x real time)")
     print(f"Decode: {dec_ms:6.1f} ms/frame  ({REALTIME_MS / dec_ms:4.1f}x real time)")
     print()

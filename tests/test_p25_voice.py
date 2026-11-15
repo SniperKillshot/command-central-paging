@@ -94,6 +94,14 @@ class VoiceFNE(FakeFNE):
 
 # ---------------------------------------------------------------------------
 
+def py_round_trip(pcm, tones=None):
+    """Through the pure Python encoder and decoder, whatever the default is:
+    the tone tuning these tests check lives there."""
+    enc, dec = PyIMBEEncoder(), PyIMBEDecoder(seed=1)
+    frames = [enc.encode(s, t) for s, t in pcm_to_frames(pcm, tones)]
+    return np.clip(np.concatenate([dec.decode(f) for f in frames]) * dec.gain, -32768, 32767)
+
+
 class VocoderTests(unittest.TestCase):
     def test_frame_packing_widths(self):
         fv = [0xFFF, 0, 0xFFF, 0, 0x7FF, 0, 0x7FF, 0x7F]
@@ -120,7 +128,7 @@ class VocoderTests(unittest.TestCase):
 
     def test_round_trip_keeps_pitch_and_loudness(self):
         pcm = tone(250, 1.0, 0.3)
-        out = decode_to_pcm(encode_pcm(pcm)).astype(float)
+        out = py_round_trip(pcm)
         seg = out[2400:4400]                          # steady state, past the codec delay
         spec = np.abs(np.fft.rfft(seg * np.hanning(seg.size)))
         peak_hz = np.argmax(spec) * 8000 / seg.size
@@ -148,7 +156,7 @@ class VocoderTests(unittest.TestCase):
         for name, targets in (('noaa_wat', [1050]), ('eas_attention', [853, 960]), ('alert_tone', [1000])):
             x, track = lib.render_with_tones(name)
             x, track = x[:12000], track[:12000]
-            out = decode_to_pcm(encode_pcm(dsp.to_pcm16(x), track)).astype(float)[3000:10000]
+            out = py_round_trip(dsp.to_pcm16(x), track)[3000:10000]
             wobble, on = wobble_and_purity(out, targets)
             self.assertLess(wobble, 0.8, name)
             self.assertGreater(on, 0.9, name)

@@ -38,7 +38,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         'sys_id': '001',
         'net_id': 'BB800',
         'priority': 4,
-        'lead_in_ms': 400,
+        'lead_in_ms': 500,
         'sound_gap_ms': 400,
         'tail_ms': 300,
         'voice_gain_db': 0,

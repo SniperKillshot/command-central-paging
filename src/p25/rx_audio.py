@@ -31,7 +31,6 @@ MSG_KEEPALIVE, MSG_AUDIO, MSG_END, MSG_ENCRYPTED = 0, 1, 2, 3
 HEADER = struct.Struct('<BBHIIH')
 DUID_LDU1, DUID_LDU2 = 0x05, 0x0A
 DUID_TDU, DUID_TDULC = 0x03, 0x0F
-GAIN = 7.0                      # same make-up gain as the preview decoder
 LISTENER_QUEUE = 100            # messages (~18 s of one call) before dropping
 LDU_VOICE_END = F.LDU1_LAYOUT[-1][1] + F.LDU1_LAYOUT[-1][2]    # last voice frame's end
 
@@ -138,5 +137,5 @@ class RxAudio:
         if call.encrypted or len(payload) < LDU_VOICE_END:
             return
         pcm = np.concatenate([call.decoder.decode(f) for f in F.ldu_imbe(payload)])
-        pcm = np.clip(np.round(pcm * GAIN), -32768, 32767)
+        pcm = np.clip(np.round(pcm * call.decoder.gain), -32768, 32767)
         self._publish(message(MSG_AUDIO, call.tgid, call.src, stream_id, pcm))

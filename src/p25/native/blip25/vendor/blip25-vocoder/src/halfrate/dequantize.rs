@@ -1,0 +1,2342 @@
+// index loops are deliberate: the index is the bin/harmonic/tap/band/bit number
+#![allow(clippy::needless_range_loop)]
+
+//! Half-rate AMBE+2 dequantization — `b̂₀..b̂₈ → MbeParams` per
+//! TIA-102.BABA-A §2.11–§2.13.
+//!
+//! These quantizer tables (Annexes L, M, N, O, P, Q, R) and the
+//! reconstruction equations are the AMBE+2 codec's normative bit
+//! interpretation as published in BABA-A's half-rate sections (the
+//! BABA-1 addendum, originally). The spec calls this "Half-Rate
+//! Vocoder" rather than "AMBE+2" to dodge the reference's trademark, but
+//! the bit rate, frame structure, and quantizer behaviour are AMBE+2
+//! in everything but name.
+//!
+//! Pipeline (mirrors full-rate's `dequantize` but with
+//! different quantizer structure):
+//!
+//! 1. Pitch: `b̂₀` (7 bits) → Annex L lookup → `(L̃, ω̃₀)`.
+//! 2. V/UV: `b̂₁` (5 bits) → Annex M codebook → 8-entry vector,
+//!    expanded per-harmonic via `k_l = ⌊l · 16 · ω̃₀ / (2π)⌋`
+//!    (§2.3.6 Eq. 147, 149).
+//! 3. Gain: `b̂₂` (5 bits) → Annex O differential quantizer,
+//!    `γ̃(0) = Δ̃_γ + 0.5·γ̃(−1)` (Eq. 168, cross-frame stateful).
+//! 4. PRBA: `b̂₃` → Annex P (G̃₂..G̃₄); `b̂₄` → Annex Q (G̃₅..G̃₈);
+//!    G̃₁ = 0. Fixed 8-point inverse DCT (Eq. 169) → R̃₁..R̃₈.
+//!    Pair-wise split (Eq. 171–178) → C̃_{i, 1..2} for i = 1..4.
+//! 5. HOC: `b̂₅..b̂₈` → Annex R placement per Reading #1 of Eq. 179:
+//!    `C̃_{i, k} = H̃_{i, k−2}` for `3 ≤ k ≤ min(J̃_i, 6)`, zero-fill
+//!    elsewhere. §2.12 admits more than one reading; this is the one
+//!    the codec implements.
+//! 6. Per-block inverse DCT (Eq. 180–181) — same form as §1.8.4 but
+//!    over 4 blocks from Annex N instead of 6 from Annex J.
+//! 7. Log-mag prediction (Eq. 182–187) with Γ̃ intercept from Eq. 184
+//!    and cross-frame `Λ̃_l(−1)` state (initialized to 1, `L̃(−1) = 15`).
+//! 8. Final M̃_l (Eq. 188) with the half-rate-specific voicing
+//!    branch: unvoiced harmonics scaled by `(0.2046 / √ω̃₀)`.
+
+use core::f64::consts::{LN_2, PI as PI64, SQRT_2};
+
+use crate::fullrate::dequantize::DecodeError;
+use crate::halfrate::frame::{
+    PitchEntry, ToneParams, AMBE_BLOCK_LENGTHS, AMBE_GAIN_LEVELS, AMBE_HOC_B5, AMBE_HOC_B6,
+    AMBE_HOC_B7, AMBE_HOC_B8, AMBE_PITCH_TABLE, AMBE_PRBA24, AMBE_PRBA58, AMBE_VUV_CODEBOOK,
+    AMBE_VUV_CODEBOOK_16, ANNEX_T,
+};
+use crate::halfrate::priority::{deprioritize, prioritize};
+use crate::mbe_params::{MbeParams, L_MAX};
+
+/// Maximum per-block length observed in Annex N (`L̃ = 56` row has
+/// `J̃₄ = 17`). Sized generously to cover the full table.
+pub const MAX_BLOCK_SIZE: usize = 17;
+
+/// Per-block DCT cosine lookup, lazily built once. `dct_cos(j_i)`
+/// returns `&[f64; j_i*j_i]` indexed by `k_0 * j_i + j_0`, holding
+/// `cos(π · k_0 · (j_0 + 0.5) / j_i)` — the kernel shared by both
+/// [`forward_block_dct`] and [`inverse_block_dct`]. Without the LUT
+/// each block does `j_i²` `f64::cos` calls per direction; the
+/// roundtrip in the analysis encoder hits both directions per frame,
+/// giving up to ~1 200 transcendentals/frame in worst-case `J̃ = 17`
+/// blocks. With the LUT it's a single multiply + table read.
+fn dct_cos(j_i: usize) -> &'static [f64] {
+    use std::sync::OnceLock;
+    static TABLES: OnceLock<[Vec<f64>; MAX_BLOCK_SIZE + 1]> = OnceLock::new();
+    let tables = TABLES.get_or_init(|| {
+        core::array::from_fn(|j| {
+            if j == 0 {
+                Vec::new()
+            } else {
+                let mut t = vec![0f64; j * j];
+                for k_0 in 0..j {
+                    for j_0 in 0..j {
+                        t[k_0 * j + j_0] =
+                            (PI64 * (k_0 as f64) * (j_0 as f64 + 0.5) / j as f64).cos();
+                    }
+                }
+                t
+            }
+        })
+    });
+    &tables[j_i]
+}
+
+/// Initial value of `L̃(−1)` for the half-rate decoder (§2.13 Annex A).
+/// Differs from full-rate's 30 (§1.8.5).
+pub const INIT_PREV_L: u8 = 15;
+
+/// Highest valid half-rate pitch index per Annex L (120 entries,
+/// `b̂₀ ∈ [0, 119]`). Values `[120, 127]` indicate tone frames;
+/// `[128, 255]` are reserved / error conditions.
+pub const PITCH_INDEX_MAX: u8 = 119;
+
+/// Cross-frame state for the half-rate decoder.
+///
+/// Two key differences from [`crate::fullrate::dequantize::DecoderState`]:
+/// - `prev_lambda` is stored in **log₂** domain (Λ̃_l(−1)), not linear.
+/// - `prev_l` initializes to 15, not 30.
+/// - `prev_gamma` carries the Eq. 168 differential-gain state, updated
+///   only on voice frames.
+#[derive(Clone, Debug)]
+pub struct DecoderState {
+    /// Previous frame's `Λ̃_l(−1)` in log₂ domain. Index 0 unused —
+    /// Eq. 186 says `Λ̃_0(−1) = Λ̃_1(−1)`, so the virtual index 0
+    /// reads mirror `Λ̃_1`. Indices `1..=prev_l` populated; reads
+    /// beyond `prev_l` clamp to `Λ̃_{prev_l}` (Eq. 187).
+    prev_lambda: [f64; L_MAX as usize + 2],
+    /// Previous frame's `L̃(−1)`. Init: 15.
+    prev_l: u8,
+    /// Previous voice frame's reconstructed gain `γ̃(−1)`. Init: 0.
+    /// Tone/silence/erasure frames do not update this.
+    prev_gamma: f64,
+    /// Decode-only: apply the reference `L = 56` / `step = 0x1079` harmonic-grid
+    /// override on frames whose `b̂₁` trips [`l56_gate_from_b1`]. Default
+    /// `false` keeps the Annex L pitch-table pairing for every frame.
+    l56_override: bool,
+}
+
+impl DecoderState {
+    /// Cold-start state per §2.13 Annex A: `Λ̃_l(−1) = 1` for all l,
+    /// `L̃(−1) = 15`, `γ̃(−1) = 0`.
+    pub fn new() -> Self {
+        Self {
+            prev_lambda: [1.0; L_MAX as usize + 2],
+            prev_l: INIT_PREV_L,
+            prev_gamma: 0.0,
+            l56_override: false,
+        }
+    }
+
+    /// Enable the decode-side `L = 56` / `step = 0x1079` harmonic-grid
+    /// override. Default off. See [`l56_gate_from_b1`].
+    pub fn set_l56_override(&mut self, on: bool) {
+        self.l56_override = on;
+    }
+
+    /// Whether the `L = 56` override is active on this state.
+    #[inline]
+    pub fn l56_override(&self) -> bool {
+        self.l56_override
+    }
+
+    /// Read `Λ̃_l(−1)` with the §2.13 edge cases:
+    /// - `l = 0` returns `Λ̃_1(−1)` (Eq. 186).
+    /// - `l > prev_l` returns `Λ̃_{prev_l}(−1)` (Eq. 187).
+    fn prev_lambda_at(&self, l: u8) -> f64 {
+        if l == 0 {
+            return self.prev_lambda[1];
+        }
+        let idx = (l as usize).min(self.prev_l as usize);
+        self.prev_lambda[idx]
+    }
+
+    /// Exposes `L̃(−1)` for diagnostics.
+    pub fn previous_l(&self) -> u8 {
+        self.prev_l
+    }
+
+    /// Exposes `γ̃(−1)` for diagnostics.
+    pub fn previous_gamma(&self) -> f64 {
+        self.prev_gamma
+    }
+}
+
+impl Default for DecoderState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §1.3.1 half-rate analog — pitch decode via Annex L
+// ---------------------------------------------------------------------------
+
+/// Result of decoding a half-rate pitch index. `k` is not carried here
+/// because half-rate doesn't have the per-band V/UV structure of full
+/// rate — V/UV is codebook-indexed per §2.3.6.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PitchInfo {
+    /// Fundamental frequency in radians/sample.
+    pub omega_0: f32,
+    /// Number of harmonics.
+    pub l: u8,
+}
+
+/// Decode the 7-bit half-rate pitch index `b̂₀`.
+///
+/// * `b̂₀ ∈ [0, 119]` → valid voice frame: looked up in
+///   [`AMBE_PITCH_TABLE`] to obtain `(L̃, ω̃₀)`.
+/// * `b̂₀ ∈ [120, 127]` → tone frame; returns `None` and the caller
+///   should switch to the §2.10 tone path.
+pub fn decode_pitch(b0: u8) -> Option<PitchInfo> {
+    if b0 > PITCH_INDEX_MAX {
+        return None;
+    }
+    let PitchEntry { l, omega_0 } = AMBE_PITCH_TABLE[b0 as usize];
+    Some(PitchInfo { omega_0, l })
+}
+
+// ---------------------------------------------------------------------------
+// The `L = 56` harmonic-grid override
+// ---------------------------------------------------------------------------
+
+/// Harmonic count used when [`l56_gate_from_b1`] fires.
+pub const L56_L: u8 = 56;
+
+/// Fundamental-frequency step used when [`l56_gate_from_b1`] fires, in the
+/// reference decoder's Q19-cycles-per-sample units: `ω₀ · 2¹⁹ / 2π`.
+/// Deliberately outside the Annex L pitch table's range.
+pub const L56_STEP: i16 = 0x1079;
+
+/// `ω₀` implied by [`L56_STEP`]: `0x1079 · 2π / 2¹⁹` ≈ 64.35 Hz at 8 kHz.
+pub(crate) const L56_OMEGA_0: f32 = 0.050_537_48;
+
+/// Does this frame's `b̂₁` select the `L = 56` harmonic grid?
+///
+/// The reference decoder does **not** always pair `L` and `ω₀` through the Annex L
+/// pitch table. Before the lookup it inspects the V/UV codeword's per-band
+/// codes and, on a structural condition, substitutes a fixed dense grid of
+/// `L = 56` harmonics at `ω₀ =` [`L56_OMEGA_0`] regardless of `b̂₀`.
+///
+/// The condition is *not* a numeric threshold on `b̂₁`: it fires exactly when
+/// **no band carries code 1** and **at least one band carries code 2**, i.e.
+/// when the codeword's voicing information is expressed entirely in the third
+/// per-band state. Over the 32 rows of [`AMBE_VUV_CODEBOOK_16`] that predicate
+/// happens to select `b̂₁ ∈ {18..=31}`, so the gate is easy to mistake for a
+/// `b̂₁ ≥ 18` threshold. That range is an emergent property of the codebook's
+/// ordering, not the mechanism — do not reimplement it as a comparison.
+///
+/// Both halves of the override are required: applying `L = 56` while keeping
+/// the pitch table's own `ω₀` moves the harmonic sampling of the spectrum
+/// without moving the grid it is read on, and measures far worse than not
+/// applying the override at all.
+///
+/// Gated off by default; see [`DecoderState::set_l56_override`].
+#[inline]
+pub fn l56_gate_from_b1(b1: u8) -> bool {
+    let cb = match AMBE_VUV_CODEBOOK_16.get(b1 as usize) {
+        Some(c) => c,
+        None => return false,
+    };
+    !cb.iter().any(|&c| c & 1 != 0) && cb.iter().any(|&c| c & 2 != 0)
+}
+
+// ---------------------------------------------------------------------------
+// §2.3.6 — V/UV codebook expansion
+// ---------------------------------------------------------------------------
+
+/// Expand the 5-bit `b̂₁` V/UV codebook index into per-harmonic
+/// decisions per Eq. 147/149: `j_l = ⌊l · 16 · ω̃₀ / (2π)⌋`, clamped
+/// to `[0, 7]`; `v̄_l = v_{j_l}(b̂₁)`.
+///
+/// Returns an `[bool; L_MAX]` with entries `0..(l as usize)` populated.
+pub fn expand_vuv(b1: u8, omega_0: f32, l: u8) -> [bool; L_MAX as usize] {
+    debug_assert!(b1 < 32, "b̂₁ is a 5-bit index");
+    debug_assert!(l <= L_MAX);
+    let omega_0 = f64::from(omega_0);
+    let mut out = [false; L_MAX as usize];
+
+    let codebook = &AMBE_VUV_CODEBOOK[b1 as usize];
+    for l_h in 1..=l {
+        let j = (f64::from(l_h) * 16.0 * omega_0 / (2.0 * PI64)).floor() as i32;
+        let j = j.clamp(0, 7) as usize;
+        out[(l_h - 1) as usize] = codebook[j];
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// §2.11 — Gain + PRBA decomposition
+// ---------------------------------------------------------------------------
+
+/// Decode the 5-bit gain index per Eq. 168:
+/// `γ̃(0) = Δ̃_γ + 0.5 · γ̃(−1)` with `Δ̃_γ = AMBE_GAIN_QUANTIZER[b̂₂]`.
+pub fn decode_gain(b2: u8, prev_gamma: f64) -> f64 {
+    debug_assert!(b2 < 32);
+    f64::from(AMBE_GAIN_LEVELS[b2 as usize]) + 0.5 * prev_gamma
+}
+
+/// Combine the two-stage PRBA codebooks into the 8-element G̃ vector.
+/// `G̃₁ = 0` per §2.11 Stage 2 ("discarded at encoder per §13.3.1").
+/// `G̃₂..G̃₄` come from [`AMBE_PRBA24`]; `G̃₅..G̃₈` from [`AMBE_PRBA58`].
+pub fn decode_prba_vector(b3: u16, b4: u8) -> [f64; 8] {
+    debug_assert!(b3 < 512 && b4 < 128);
+    let p = AMBE_PRBA24[b3 as usize];
+    let q = AMBE_PRBA58[b4 as usize];
+    [
+        0.0,
+        f64::from(p[0]),
+        f64::from(p[1]),
+        f64::from(p[2]),
+        f64::from(q[0]),
+        f64::from(q[1]),
+        f64::from(q[2]),
+        f64::from(q[3]),
+    ]
+}
+
+/// Apply the fixed 8-point inverse DCT (Eq. 169–170) to the
+/// transformed PRBA vector `G̃₁..G̃₈`, producing `R̃₁..R̃₈`.
+pub fn prba_to_residuals(g: &[f64; 8]) -> [f64; 8] {
+    let mut r = [0f64; 8];
+    for i_0 in 0..8 {
+        let i_half = i_0 as f64 + 0.5;
+        let mut acc = 0f64;
+        for m_0 in 0..8 {
+            let alpha = if m_0 == 0 { 1.0 } else { 2.0 };
+            let arg = PI64 * (m_0 as f64) * i_half / 8.0;
+            acc += alpha * g[m_0] * arg.cos();
+        }
+        r[i_0] = acc;
+    }
+    r
+}
+
+/// Pair-wise split (Eq. 171–178) of `R̃₁..R̃₈` into per-block
+/// `(C̃_{i,1}, C̃_{i,2})` for `i = 1..=4`.
+pub fn pair_split(r: &[f64; 8]) -> [(f64, f64); 4] {
+    // Eq. 172 weight: √2 / 4 = 1 / (2·√2).
+    let w = SQRT_2 / 4.0;
+    [
+        ((r[0] + r[1]) / 2.0, w * (r[0] - r[1])),
+        ((r[2] + r[3]) / 2.0, w * (r[2] - r[3])),
+        ((r[4] + r[5]) / 2.0, w * (r[4] - r[5])),
+        ((r[6] + r[7]) / 2.0, w * (r[6] - r[7])),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// §2.12 — HOC placement (Reading #1)
+// ---------------------------------------------------------------------------
+
+/// Populate the 4-block DCT coefficient matrix `C̃_{i, k}` for the
+/// half-rate decoder. Block means and `k=2` come from the PRBA
+/// pair-split; `k=3..min(J̃_i, 6)` come from Annex R (Reading #1 of
+/// Eq. 179); everything else is zero.
+///
+/// Returns a 4×`MAX_BLOCK_SIZE` matrix; only `[i][0..J̃_i]`
+/// is meaningful.
+pub fn assemble_hoc_matrix(
+    pair: &[(f64, f64); 4],
+    b5: u8,
+    b6: u8,
+    b7: u8,
+    b8: u8,
+    blocks: &[u8; 4],
+) -> [[f64; MAX_BLOCK_SIZE]; 4] {
+    debug_assert!(b5 < 32 && b6 < 16 && b7 < 16 && b8 < 8);
+    let hoc: [[f32; 4]; 4] = [
+        AMBE_HOC_B5[b5 as usize],
+        AMBE_HOC_B6[b6 as usize],
+        AMBE_HOC_B7[b7 as usize],
+        AMBE_HOC_B8[b8 as usize],
+    ];
+    let mut c = [[0f64; MAX_BLOCK_SIZE]; 4];
+    for i in 0..4 {
+        c[i][0] = pair[i].0; // C̃_{i,1} — block mean
+        c[i][1] = pair[i].1; // C̃_{i,2} — first non-mean
+        let j_i = blocks[i] as usize;
+        // Reading #1: k = 3..=min(J̃_i, 6) → H̃_{i, k-2}.
+        // 1-based k maps to 0-based index (k-1); H̃ array is 0-indexed
+        // 0..=3 corresponding to 1-based (k-2)=1..=4.
+        let k_max = j_i.min(6);
+        for k in 3..=k_max {
+            c[i][k - 1] = f64::from(hoc[i][k - 3]);
+        }
+    }
+    c
+}
+
+// ---------------------------------------------------------------------------
+// §2.13 — Per-block inverse DCT + log-mag reconstruction
+// ---------------------------------------------------------------------------
+
+/// Per-block inverse DCT (Eq. 180–181) with concatenation into `T̃_l`
+/// for `l = 1..=L̃`. This is the §1.8.4 form but over four half-rate
+/// blocks from Annex N rather than the six full-rate blocks from
+/// Annex J.
+pub fn inverse_block_dct(
+    c: &[[f64; MAX_BLOCK_SIZE]; 4],
+    blocks: &[u8; 4],
+) -> [f64; L_MAX as usize] {
+    let mut t = [0f64; L_MAX as usize];
+    let mut l_offset = 0usize;
+    for i in 0..4 {
+        let j_i = blocks[i] as usize;
+        if j_i == 0 {
+            continue;
+        }
+        let cos_tab = dct_cos(j_i);
+        for j_0 in 0..j_i {
+            let mut acc = 0f64;
+            for k_0 in 0..j_i {
+                let alpha = if k_0 == 0 { 1.0 } else { 2.0 };
+                acc += alpha * c[i][k_0] * cos_tab[k_0 * j_i + j_0];
+            }
+            t[l_offset + j_0] = acc;
+        }
+        l_offset += j_i;
+    }
+    t
+}
+
+/// Apply the half-rate log-magnitude prediction (Eq. 182–187) to
+/// produce `Λ̃_l(0)` for `l = 1..=L̃`. Returns an array sized to
+/// `L_MAX + 2`; index 0 unused, indices `1..=l` hold the log₂-domain
+/// magnitudes.
+pub fn apply_log_prediction(
+    t: &[f64; L_MAX as usize],
+    l: u8,
+    gamma: f64,
+    state: &DecoderState,
+) -> [f64; L_MAX as usize + 2] {
+    let mut lambda = [0f64; L_MAX as usize + 2];
+    let l_curr = f64::from(l);
+    let l_prev = f64::from(state.prev_l);
+
+    // Γ̃ = γ̃(0) − 0.5·log₂(L̃) − (1/L̃)·Σ T̃_λ  (Eq. 184)
+    let t_sum: f64 = t[..l as usize].iter().sum();
+    let gamma_intercept = gamma - 0.5 * l_curr.log2() - t_sum / l_curr;
+
+    // Global mean of the predictor terms.
+    let mut mean_sum = 0f64;
+    for lambda_idx in 1..=l {
+        let k_l = l_prev * f64::from(lambda_idx) / l_curr;
+        let k_floor = k_l.floor();
+        let delta = k_l - k_floor;
+        let log_lo = state.prev_lambda_at(k_floor as u8);
+        let log_hi = state.prev_lambda_at(k_floor as u8 + 1);
+        mean_sum += (1.0 - delta) * log_lo + delta * log_hi;
+    }
+    let mean = mean_sum / l_curr;
+
+    // Per-harmonic reconstruction with +Γ̃ intercept.
+    for l_h in 1..=l {
+        let k_l = l_prev * f64::from(l_h) / l_curr;
+        let k_floor = k_l.floor();
+        let delta = k_l - k_floor;
+        let log_lo = state.prev_lambda_at(k_floor as u8);
+        let log_hi = state.prev_lambda_at(k_floor as u8 + 1);
+        lambda[l_h as usize] =
+            t[(l_h - 1) as usize] + 0.65 * (1.0 - delta) * log_lo + 0.65 * delta * log_hi
+                - 0.65 * mean
+                + gamma_intercept;
+    }
+    lambda
+}
+
+/// Convert `Λ̃_l(0)` to linear `M̃_l` per Eq. 188:
+/// voiced → `exp(ln 2 · Λ̃_l)`; unvoiced → `(0.2046/√ω̃₀) · exp(ln 2 · Λ̃_l)`.
+///
+/// The unvoiced rescale is half-rate-specific (no analog in full-rate
+/// Eq. 79).
+pub fn compute_m_tilde(
+    lambda: &[f64; L_MAX as usize + 2],
+    voiced: &[bool],
+    omega_0: f32,
+) -> [f32; L_MAX as usize] {
+    let l = voiced.len();
+    debug_assert!(l <= L_MAX as usize);
+    let mut m = [0f32; L_MAX as usize];
+    let uv_scale = 0.2046 / f64::from(omega_0).sqrt();
+    for l_h in 1..=l {
+        let linear = (LN_2 * lambda[l_h]).exp();
+        m[l_h - 1] = if voiced[l_h - 1] {
+            linear as f32
+        } else {
+            (uv_scale * linear) as f32
+        };
+    }
+    m
+}
+
+// ---------------------------------------------------------------------------
+// Top-level half-rate dequantization
+// ---------------------------------------------------------------------------
+
+/// Run the half-rate dequantization pipeline end-to-end:
+/// `(û₀..û₃, state) → MbeParams`.
+///
+/// Returns `DecodeError::BadPitch` for `b̂₀ ∈ [120, 255]` — the caller
+/// should switch to the tone path (§2.10) for `b̂₀ ∈ [120, 127]` and
+/// treat `[128, 255]` as an erasure condition.
+pub fn dequantize(u: &[u16; 4], state: &mut DecoderState) -> Result<MbeParams, DecodeError> {
+    let b = deprioritize(u);
+    let b0 = b[0] as u8;
+    let pitch = decode_pitch(b0).ok_or(DecodeError::BadPitch)?;
+    let b1 = b[1] as u8;
+
+    // The `L = 56` override is applied AFTER the pitch lookup on purpose.
+    // Testing the gate first sends tone/erasure `b̂₀ ≥ 120` frames down the
+    // speech path, which collapses tones to silence. The tone path here matches
+    // the reference to within 0.61 dB and must keep priority over the override.
+    let (l, omega_0) = if state.l56_override && l56_gate_from_b1(b1) {
+        (L56_L, L56_OMEGA_0)
+    } else {
+        (pitch.l, pitch.omega_0)
+    };
+
+    let voiced = expand_vuv(b1, omega_0, l);
+
+    let b2 = b[2] as u8;
+    let gamma = decode_gain(b2, state.prev_gamma);
+
+    let g = decode_prba_vector(b[3], b[4] as u8);
+    let r = prba_to_residuals(&g);
+    let pair = pair_split(&r);
+
+    let blocks = AMBE_BLOCK_LENGTHS[(l - 9) as usize];
+    let c = assemble_hoc_matrix(
+        &pair, b[5] as u8, b[6] as u8, b[7] as u8, b[8] as u8, &blocks,
+    );
+
+    let t = inverse_block_dct(&c, &blocks);
+    let lambda = apply_log_prediction(&t, l, gamma, state);
+    let m_tilde = compute_m_tilde(&lambda, &voiced[..l as usize], omega_0);
+
+    let params = MbeParams::new(omega_0, l, &voiced[..l as usize], &m_tilde[..l as usize])
+        .map_err(DecodeError::InvalidParams)?;
+
+    // Update cross-frame state (voice frame — γ̃ and Λ̃ both advance).
+    state.prev_lambda[1..(l as usize + 1)].copy_from_slice(&lambda[1..(l as usize + 1)]);
+    for l_h in (l as usize + 1)..=L_MAX as usize + 1 {
+        state.prev_lambda[l_h] = lambda[l as usize];
+    }
+    state.prev_l = l;
+    state.prev_gamma = gamma;
+
+    Ok(params)
+}
+
+// ===========================================================================
+// Half-rate encoder (forward / quantize path) — symmetric to the decoder
+// blocks above. References: inverse of §2.11 Eq. 168–178 pair-sum/DCT,
+// inverse of §2.12 HOC placement (Reading #1), inverse of §2.13 Eq. 182–188.
+// ===========================================================================
+
+/// Encode a fundamental frequency to a 7-bit half-rate pitch index by
+/// argmin over [`AMBE_PITCH_TABLE`]. The table is monotone decreasing
+/// in ω̃₀, so we binary-search.
+///
+/// Returns `None` if `omega_0` is not in the table's range.
+pub(crate) fn encode_pitch(omega_0: f32) -> Option<u8> {
+    if !(omega_0.is_finite()) || omega_0 <= 0.0 {
+        return None;
+    }
+    let target = f64::from(omega_0);
+    let (first, last) = (
+        f64::from(AMBE_PITCH_TABLE[0].omega_0),
+        f64::from(AMBE_PITCH_TABLE[AMBE_PITCH_TABLE.len() - 1].omega_0),
+    );
+    if target > first * 1.000001 || target < last * 0.999999 {
+        return None;
+    }
+
+    // Binary search on the monotone-decreasing table.
+    let mut lo = 0usize;
+    let mut hi = AMBE_PITCH_TABLE.len() - 1;
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        if f64::from(AMBE_PITCH_TABLE[mid].omega_0) >= target {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    // Pick whichever of `lo`, `hi` is closer.
+    let d_lo = (target - f64::from(AMBE_PITCH_TABLE[lo].omega_0)).abs();
+    let d_hi = (target - f64::from(AMBE_PITCH_TABLE[hi].omega_0)).abs();
+    Some(if d_hi < d_lo { hi as u8 } else { lo as u8 })
+}
+
+/// Quantize `ω̃₀` to a 7-bit `b̂₀` index using the **closed-form floor rule**
+/// observed in the reference, rather than a nearest-neighbour search of
+/// [`AMBE_PITCH_TABLE`].
+///
+/// Given the pitch period `P = 2π/ω̃₀` in 8 kHz samples:
+///
+/// ```text
+/// t  = floor(4096 · log2(P))
+/// b0 = clamp( ((t − 17661) · 240) div 21668 − 120,  0, 119 )
+/// ```
+///
+/// This is arithmetic, not table data: it *reproduces* all 120 Annex L rows
+/// exactly (see `reference_pitch_quantizer_reproduces_annex_l`), so it carries no
+/// codebook dependence.
+///
+/// # Why this differs from [`encode_pitch`]
+///
+/// [`encode_pitch`] picks the nearest Annex L reconstruction point, which
+/// assumes the decision boundary sits at the midpoint between adjacent table
+/// entries. It does not: the reconstruction point sits at roughly **78% of the
+/// way through its own decision cell**. The two rules therefore disagree on
+/// ~26% of uniformly drawn ω̃₀, and — because the asymmetry is one-sided —
+/// **every disagreement is `encode_pitch` returning exactly one index too low**
+/// (see `reference_pitch_quantizer_divergence_is_one_sided`).
+///
+/// Returns `None` outside the representable band, matching [`encode_pitch`].
+pub fn encode_pitch_reference(omega_0: f32) -> Option<u8> {
+    if !omega_0.is_finite() || omega_0 <= 0.0 {
+        return None;
+    }
+    let target = f64::from(omega_0);
+    let (first, last) = (
+        f64::from(AMBE_PITCH_TABLE[0].omega_0),
+        f64::from(AMBE_PITCH_TABLE[AMBE_PITCH_TABLE.len() - 1].omega_0),
+    );
+    if target > first * 1.000_001 || target < last * 0.999_999 {
+        return None;
+    }
+
+    // Unit convention, and it is a trap worth spelling out.
+    //
+    // Annex L is published in *cycles/sample*; `AMBE_PITCH_TABLE` holds
+    // *rad/sample* (2π×). The reference rule's constant 17661 is fitted
+    // against `2π / ω₀_cycles`, i.e. 2π× the true pitch period — so feeding
+    // it the true period `2π/ω₀_rad` is off by a factor of 2π and reproduces
+    // 1/120 rows instead of 120/120.
+    //
+    // Expressed from rad/sample, the argument the constant expects is
+    //   2π / (ω₀_rad / 2π) = 4π² / ω₀_rad.
+    //
+    // (The source spec's prose calls this "the pitch period in 8 kHz samples",
+    // which contradicts its own verification script. The script is the part
+    // that reproduces Annex L, so the script wins. Either way this stays a
+    // pure closed form over the public table — no codebook dependence.)
+    let scaled_period = 4.0 * PI64 * PI64 / target;
+    let t = (4096.0 * scaled_period.log2()).floor() as i64;
+    // `div_euclid` gives floor division, matching the reference on negative
+    // numerators; within the valid band trunc and floor agree on all 120 rows.
+    let b0 = ((t - 17_661) * 240).div_euclid(21_668) - 120;
+    Some(b0.clamp(0, 119) as u8)
+}
+
+/// Encode per-harmonic voicing decisions into a 5-bit Annex M
+/// codebook index (`b̂₁`) per §2.3.6 inverse.
+///
+/// Strategy: first bin each harmonic into one of the 8 codebook slots
+/// using the same `j_l = ⌊l · 16 · ω̃₀ / (2π)⌋` rule the decoder uses;
+/// take the majority vote (tie → voiced) for each **active** slot.
+/// Inactive slots (no harmonic landed there) are "don't care" in the
+/// argmin — a legitimate decoder interpretation since the decoder only
+/// consults `codebook[b̂₁][j_l]` at the active `j_l` values.
+///
+/// This means rows that agree on the active slots but differ on the
+/// inactive ones are indistinguishable; the encoder breaks such ties
+/// by picking the lowest codebook index.
+///
+/// **Roundtrip note.** Because of the don't-care semantics, only
+/// codebook rows whose active-slot pattern is unique in the codebook
+/// (or that are the lowest-indexed row with that pattern) round-trip
+/// bit-exact. Row 0 (all voiced) is always the lowest such row; other
+/// rows may not.
+pub(crate) fn encode_vuv(voiced: &[bool], omega_0: f32) -> u8 {
+    let omega_0 = f64::from(omega_0);
+    let mut voted = [0i32; 8]; // +1 voiced, −1 unvoiced, summed per slot
+    let mut active = [false; 8];
+    for (i, &v) in voiced.iter().enumerate() {
+        let l_h = (i + 1) as f64;
+        let j = (l_h * 16.0 * omega_0 / (2.0 * PI64)).floor() as i32;
+        let j = j.clamp(0, 7) as usize;
+        voted[j] += if v { 1 } else { -1 };
+        active[j] = true;
+    }
+    let mut best_idx = 0u8;
+    let mut best_d = u32::MAX;
+    for (idx, row) in AMBE_VUV_CODEBOOK.iter().enumerate() {
+        let mut d = 0u32;
+        for k in 0..8 {
+            if active[k] {
+                // Active slot: target is voted-voiced if vote ≥ 0.
+                let target_k = voted[k] >= 0;
+                if row[k] != target_k {
+                    d += 1;
+                }
+            }
+            // Inactive slot: don't-care, contributes 0.
+        }
+        if d < best_d {
+            best_d = d;
+            best_idx = idx as u8;
+        }
+    }
+    best_idx
+}
+
+/// Encode a raw Δ̃_γ (differential gain) to a 5-bit Annex O index by
+/// nearest-neighbour argmin. Annex O is strictly monotone increasing
+/// so binary search works. Ties go low.
+pub(crate) fn encode_gain(delta_gamma: f64) -> u8 {
+    if delta_gamma <= f64::from(AMBE_GAIN_LEVELS[0]) {
+        return 0;
+    }
+    let last = AMBE_GAIN_LEVELS.len() - 1;
+    if delta_gamma >= f64::from(AMBE_GAIN_LEVELS[last]) {
+        return last as u8;
+    }
+    let mut lo = 0usize;
+    let mut hi = last;
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        if f64::from(AMBE_GAIN_LEVELS[mid]) <= delta_gamma {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let d_lo = (delta_gamma - f64::from(AMBE_GAIN_LEVELS[lo])).abs();
+    let d_hi = (f64::from(AMBE_GAIN_LEVELS[hi]) - delta_gamma).abs();
+    if d_hi < d_lo {
+        hi as u8
+    } else {
+        lo as u8
+    }
+}
+
+/// Inverse of [`pair_split`] — encoder Eq. 159–160 from BABA-A §13.3.1.
+/// Given per-block `(C̃_{i,1}, C̃_{i,2})`, produce `R̃₁..R̃₈`.
+pub(crate) fn pair_join(pair: &[(f64, f64); 4]) -> [f64; 8] {
+    let mut r = [0f64; 8];
+    for i in 0..4 {
+        let (mean, k2) = pair[i];
+        r[2 * i] = mean + SQRT_2 * k2;
+        r[2 * i + 1] = mean - SQRT_2 * k2;
+    }
+    r
+}
+
+/// Forward 8-point DCT — inverse of [`prba_to_residuals`], producing
+/// the transformed PRBA vector `G̃₁..G̃₈` from `R̃₁..R̃₈`. Uniform `1/8`
+/// forward factor per the asymmetric DCT pairing (no α weighting —
+/// that lives on the inverse side per §1.8.3 / disambiguations §9).
+pub(crate) fn residuals_to_prba(r: &[f64; 8]) -> [f64; 8] {
+    let mut g = [0f64; 8];
+    for m_0 in 0..8 {
+        let mut acc = 0f64;
+        for i_0 in 0..8 {
+            let i_half = i_0 as f64 + 0.5;
+            let arg = PI64 * (m_0 as f64) * i_half / 8.0;
+            acc += r[i_0] * arg.cos();
+        }
+        g[m_0] = acc / 8.0;
+    }
+    g
+}
+
+/// Find the closest entry in an N×K vector quantizer codebook to
+/// `target`. Returns the codebook index.
+fn vq_nearest<const K: usize>(target: &[f64; K], book: &[[f32; K]]) -> usize {
+    vq_nearest_dim(target, book, K)
+}
+
+/// As [`vq_nearest`], but scoring only the leading `dim` dimensions.
+///
+/// The codebook rows keep their full width `K` — only the *search* is
+/// narrowed. This matters when the source vector carries fewer than `K`
+/// meaningful coefficients: scoring the absent tail against the codebook
+/// biases selection toward rows with small trailing entries, because those
+/// rows happen to sit closer to the zero-fill. Ties resolve to the lowest
+/// index (strict `<`), which is first-min-wins.
+fn vq_nearest_dim<const K: usize>(target: &[f64; K], book: &[[f32; K]], dim: usize) -> usize {
+    let dim = dim.min(K);
+    let mut best_idx = 0usize;
+    let mut best_d = f64::INFINITY;
+    for (idx, row) in book.iter().enumerate() {
+        let mut d = 0f64;
+        for k in 0..dim {
+            let e = target[k] - f64::from(row[k]);
+            d += e * e;
+        }
+        if d < best_d {
+            best_d = d;
+            best_idx = idx;
+        }
+    }
+    best_idx
+}
+
+/// Quantize the PRBA vector `G̃₁..G̃₈` into the two VQ indices
+/// `(b̂₃, b̂₄)`. `G̃₁` is always discarded at the encoder per §13.3.1
+/// (it's reconstructed as 0 at the decoder), so only `G̃₂..G̃₈` are used.
+pub(crate) fn quantize_prba(g: &[f64; 8]) -> (u16, u8) {
+    let g24: [f64; 3] = [g[1], g[2], g[3]];
+    let g58: [f64; 4] = [g[4], g[5], g[6], g[7]];
+    let b3 = vq_nearest(&g24, &AMBE_PRBA24) as u16;
+    let b4 = vq_nearest(&g58, &AMBE_PRBA58) as u8;
+    (b3, b4)
+}
+
+/// Quantize the per-block HOC coefficients `C̃_{i, 3..=6}` for one
+/// block to its Annex R codebook index. For blocks with `J̃_i < 3`
+/// there are no HOCs to encode — returns 0.
+///
+/// The search is narrowed to the `dim = min(J̃_i − 2, 4)` dimensions the block
+/// actually carries, matching [`assemble_hoc_matrix`], which reconstructs
+/// `C̃_{i,k}` only for `k = 3..=min(J̃_i, 6)` and leaves the rest of the
+/// codebook row unread. Scoring the unread tail against a zero-filled target
+/// would bias selection toward rows whose trailing entries happen to be small,
+/// so the encoder would answer a question the decoder never asks — and, being an
+/// encode-only bias, the disagreement survives a decode/re-encode round trip.
+/// the engine module's amplitude quantizer narrows the same way: it derives
+/// `coeffs = lens[k] - 2`, clamps it with `if coeffs > 4 { 4 } else { coeffs }`,
+/// and passes that as the dimension count of its nearest-neighbour search over a
+/// stride-4 codebook, copying back only that many entries.
+fn quantize_hoc_block(c_block: &[f64; MAX_BLOCK_SIZE], j_i: u8, book: &[[f32; 4]]) -> u8 {
+    if j_i < 3 {
+        return 0;
+    }
+    // We encode C̃_{i,3..=min(J̃_i, 6)} → H̃_{i, 1..=(min-2)}.
+    let k_max = j_i.min(6) as usize;
+    let mut target = [0f64; 4];
+    // C̃_{i,k} at 0-based index (k-1) → H̃_{i, k-2} at 0-based (k-3).
+    target[..((k_max - 3) + 1)].copy_from_slice(&c_block[(3 - 1)..((k_max - 1) + 1)]);
+    vq_nearest_dim(&target, book, k_max - 2) as u8
+}
+
+/// Populate `(b̂₅..b̂₈)` from the per-block HOC coefficients.
+pub(crate) fn quantize_hoc_all(
+    c: &[[f64; MAX_BLOCK_SIZE]; 4],
+    blocks: &[u8; 4],
+) -> (u8, u8, u8, u8) {
+    (
+        quantize_hoc_block(&c[0], blocks[0], &AMBE_HOC_B5),
+        quantize_hoc_block(&c[1], blocks[1], &AMBE_HOC_B6),
+        quantize_hoc_block(&c[2], blocks[2], &AMBE_HOC_B7),
+        quantize_hoc_block(&c[3], blocks[3], &AMBE_HOC_B8),
+    )
+}
+
+/// Forward per-block DCT — inverse of [`inverse_block_dct`].
+/// Uses uniform `1/J̃_i` factor per the asymmetric DCT pairing.
+/// Reads `T̃_l` concatenated across `l = 1..=L̃`, partitions into 4
+/// blocks per Annex N, and produces `C̃_{i, k}` for each.
+pub fn forward_block_dct(
+    t: &[f64; L_MAX as usize],
+    blocks: &[u8; 4],
+) -> [[f64; MAX_BLOCK_SIZE]; 4] {
+    let mut c = [[0f64; MAX_BLOCK_SIZE]; 4];
+    let mut l_offset = 0usize;
+    for i in 0..4 {
+        let j_i = blocks[i] as usize;
+        if j_i == 0 {
+            continue;
+        }
+        let cos_tab = dct_cos(j_i);
+        let inv_j = 1.0 / j_i as f64;
+        for k_0 in 0..j_i {
+            let mut acc = 0f64;
+            for j_0 in 0..j_i {
+                acc += t[l_offset + j_0] * cos_tab[k_0 * j_i + j_0];
+            }
+            c[i][k_0] = acc * inv_j;
+        }
+        l_offset += j_i;
+    }
+    c
+}
+
+/// Forward log-magnitude prediction — inverse of
+/// [`apply_log_prediction`]. Given the target `Λ̃_l(0)`
+/// values and the previous-frame state, produce `T̃_l` values that
+/// the decoder will reconstruct back into `Λ̃_l(0)`.
+///
+/// The encoder chooses `T̃` to have **zero mean** (the simplest of
+/// the infinite valid `T̃` families under Eq. 185; any choice with
+/// mean `m_T` just offsets `Γ̃` by `−m_T`). With `mean(T̃) = 0` the
+/// encoder gain is simply `γ̃(0) = 0.5·log₂(L̃) + mean(Λ̃)`.
+pub(crate) fn forward_log_prediction(
+    lambda: &[f64; L_MAX as usize + 2],
+    l: u8,
+    state: &DecoderState,
+) -> ([f64; L_MAX as usize], f64) {
+    let l_curr = f64::from(l);
+    let l_prev = f64::from(state.prev_l);
+
+    // Predictor terms (same linear interpolation as the decoder).
+    let mut pred = [0f64; L_MAX as usize];
+    let mut mean_pred = 0f64;
+    for l_h in 1..=l {
+        let k_l = l_prev * f64::from(l_h) / l_curr;
+        let k_floor = k_l.floor();
+        let delta = k_l - k_floor;
+        let log_lo = state.prev_lambda_at(k_floor as u8);
+        let log_hi = state.prev_lambda_at(k_floor as u8 + 1);
+        let p = (1.0 - delta) * log_lo + delta * log_hi;
+        pred[(l_h - 1) as usize] = p;
+        mean_pred += p;
+    }
+    mean_pred /= l_curr;
+
+    // Target mean of Λ̃ sets γ̃(0) directly.
+    let mut mean_lambda = 0f64;
+    for l_h in 1..=l {
+        mean_lambda += lambda[l_h as usize];
+    }
+    mean_lambda /= l_curr;
+    let gamma = mean_lambda + 0.5 * l_curr.log2();
+    // With mean(T̃) = 0, Γ̃ = mean(Λ̃) - mean(T̃) = mean(Λ̃).
+    let gamma_intercept = mean_lambda;
+
+    // T̃_l = Λ̃_l − 0.65·pred_l + 0.65·mean_pred − Γ̃.
+    let mut t = [0f64; L_MAX as usize];
+    for l_h in 1..=l {
+        let idx = (l_h - 1) as usize;
+        t[idx] = lambda[l_h as usize] - 0.65 * pred[idx] + 0.65 * mean_pred - gamma_intercept;
+    }
+    (t, gamma)
+}
+
+/// Convert linear `M̃_l` back to log₂-domain `Λ̃_l` per the inverse
+/// of Eq. 188. The unvoiced rescale factor `(0.2046/√ω̃₀)` is removed
+/// so `Λ̃_l` reflects the *pre-voicing-scale* log-magnitude.
+pub(crate) fn m_tilde_to_lambda(
+    m_tilde: &[f32],
+    voiced: &[bool],
+    omega_0: f32,
+) -> [f64; L_MAX as usize + 2] {
+    let l = m_tilde.len();
+    debug_assert_eq!(voiced.len(), l);
+    let mut lambda = [0f64; L_MAX as usize + 2];
+    let uv_scale = 0.2046 / f64::from(omega_0).sqrt();
+    for i in 0..l {
+        let m = f64::from(m_tilde[i]);
+        if m <= 0.0 {
+            // log₂(0) is -∞; clamp to a very small value to avoid
+            // NaNs. Zero amplitude frames are unusual for voiced MBE.
+            lambda[i + 1] = -1000.0;
+        } else {
+            let linear = if voiced[i] { m } else { m / uv_scale };
+            lambda[i + 1] = linear.log2();
+        }
+    }
+    lambda
+}
+
+/// Top-level half-rate encoder: `(MbeParams, &mut state) → û₀..û₃`.
+///
+/// Mirrors [`dequantize`] exactly. The encoder uses the same
+/// `DecoderState` that the decoder would — on successful
+/// encode, state advances exactly as the decoder would advance after
+/// re-parsing the produced bits, keeping encoder and decoder
+/// synchronized for multi-frame bit-exact roundtrips.
+pub fn quantize(params: &MbeParams, state: &mut DecoderState) -> Result<[u16; 4], DecodeError> {
+    let l = params.harmonic_count();
+    let omega_0 = params.omega_0();
+
+    let b0 = encode_pitch(omega_0).ok_or(DecodeError::BadPitch)? as u16;
+
+    let voiced_slice = params.voiced_slice();
+    let b1 = u16::from(encode_vuv(voiced_slice, omega_0));
+
+    // Target Λ̃_l from linear M̃_l, then forward log-mag prediction.
+    let lambda = m_tilde_to_lambda(params.amplitudes_slice(), voiced_slice, omega_0);
+    let (t, gamma) = forward_log_prediction(&lambda, l, state);
+
+    // Quantize gain: Δ̃_γ = γ̃(0) − 0.5·γ̃(−1); argmin over Annex O.
+    let delta_gamma = gamma - 0.5 * state.prev_gamma;
+    let b2 = u16::from(encode_gain(delta_gamma));
+
+    // Forward block DCT → C̃_{i,k}.
+    let blocks = AMBE_BLOCK_LENGTHS[(l - 9) as usize];
+    let c = forward_block_dct(&t, &blocks);
+
+    // Pair-join block means + k=2 → R̃₁..R̃₈.
+    let pair: [(f64, f64); 4] = core::array::from_fn(|i| (c[i][0], c[i][1]));
+    let r = pair_join(&pair);
+
+    // Forward 8-point DCT → G̃₁..G̃₈. G̃₁ is discarded; quantize G̃₂..G̃₈.
+    let g = residuals_to_prba(&r);
+    let (b3, b4) = quantize_prba(&g);
+
+    // HOC VQ per block.
+    let (b5, b6, b7, b8) = quantize_hoc_all(&c, &blocks);
+
+    // Prioritize b̂₀..b̂₈ into û₀..û₃.
+    let mut b = [0u16; 9];
+    b[0] = b0;
+    b[1] = b1;
+    b[2] = b2;
+    b[3] = b3;
+    b[4] = u16::from(b4);
+    b[5] = u16::from(b5);
+    b[6] = u16::from(b6);
+    b[7] = u16::from(b7);
+    b[8] = u16::from(b8);
+    let u = prioritize(&b);
+
+    // State advance — mirror the decoder's updates so encoder and
+    // decoder stay in lockstep frame-by-frame. γ̃ advances on the
+    // *quantized* value, not the target, so a decoder re-parsing the
+    // produced bits sees the same state.
+    let delta_gamma_q = f64::from(AMBE_GAIN_LEVELS[b2 as usize]);
+    let gamma_q = delta_gamma_q + 0.5 * state.prev_gamma;
+    // Λ̃, by contrast, is stored as the *target*, not the decoder's
+    // reconstruction of the emitted bits, on the assumption that
+    // gain/PRBA/HOC quantization is near-identity.
+    state.prev_lambda[1..(l as usize + 1)].copy_from_slice(&lambda[1..(l as usize + 1)]);
+    for l_h in (l as usize + 1)..=L_MAX as usize + 1 {
+        state.prev_lambda[l_h] = lambda[l as usize];
+    }
+    state.prev_l = l;
+    state.prev_gamma = gamma_q;
+
+    Ok(u)
+}
+
+// ---------------------------------------------------------------------------
+// §2.10 — Tone frame dispatch, parsing, and MBE-bridge synthesis
+// ---------------------------------------------------------------------------
+
+/// Annex T sinusoidal-amplitude scale factor per §2.10.3 Eq. 209.
+/// `M̃_l = 16384 · 10^{0.03555·(A_D − 127)}` at the tone's harmonic
+/// indices.
+pub const TONE_AMPLITUDE_PEAK: f64 = 16384.0;
+
+/// `log10` exponent multiplier in Eq. 209 — 0.711 dB/step in linear form.
+pub const TONE_AMPLITUDE_EXPONENT_STEP: f64 = 0.03555;
+
+/// Classification of a received half-rate frame prior to MBE decode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FrameKind {
+    /// Normal voice frame — dequantize per §2.11–§2.13.
+    Voice,
+    /// Tone frame per §2.10 — parse ID/amplitude and synthesize via
+    /// the MBE bridge.
+    Tone,
+    /// Erasure / silence marker per §13.1 Table 14 (`b̂₀ ∈ [120, 125]`)
+    /// or reserved range (`b̂₀ ∈ [128, 255]`). Decoder should repeat
+    /// the previous frame per §2.8.
+    Erasure,
+}
+
+/// Bits extracted from a tone frame per §2.10.2.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ToneFrameFields {
+    /// 8-bit tone ID (`I_D`).
+    pub id: u8,
+    /// 7-bit log-amplitude (`A_D ∈ [0, 127]`).
+    pub amplitude: u8,
+}
+
+/// Parsed half-rate frame — one of three kinds.
+#[derive(Clone, Debug)]
+pub enum Decoded {
+    /// Normal voice frame with reconstructed [`MbeParams`].
+    Voice(MbeParams),
+    /// Tone frame with its ID/amplitude fields plus the MBE
+    /// parameters produced by Eq. 206–209. The params feed directly
+    /// into the §1.12 synthesizer.
+    Tone {
+        /// Annex T `(I_D, A_D)` extracted from the tone-frame layout.
+        fields: ToneFrameFields,
+        /// MBE parameters built from `fields` via Eq. 206–209;
+        /// suitable for direct dispatch into the synthesizer.
+        params: MbeParams,
+    },
+    /// Erasure — caller should repeat the previous frame.
+    Erasure,
+}
+
+/// Classify a half-rate frame from its prioritized info vectors
+/// `û₀..û₃` per §2.10.1.
+///
+/// **Signature-first dispatch.** The tone-frame identification is
+/// `û₀(11..6) == 0x3F` with trailer `û₃(3..0) == 0` — not the voice-
+/// path `b̂₀` value. A legitimate voice frame cannot produce this
+/// signature because voice-path `b̂₀(6..3) = 1111` would require
+/// `b̂₀ ≥ 120`, which is outside Annex L's valid pitch range.
+pub fn classify_frame(u: &[u16; 4]) -> FrameKind {
+    // Signature + trailer check first — tone frames use their own
+    // bit layout (Table 20), so voice deprioritization is irrelevant
+    // until we've ruled out tone.
+    if ((u[0] >> 6) & 0x3F) == 0x3F && (u[3] & 0x0F) == 0 {
+        return FrameKind::Tone;
+    }
+    // Not a tone frame — deprioritize and check `b̂₀` against Annex L's
+    // valid range `[0, 119]`. Any `b̂₀ ≥ 120` with no signature is an
+    // erasure (§13.1 Table 14) or reserved.
+    let b = deprioritize(u);
+    let b0 = b[0] as u8;
+    if b0 <= PITCH_INDEX_MAX {
+        FrameKind::Voice
+    } else {
+        FrameKind::Erasure
+    }
+}
+
+/// Parse tone-frame fields per §2.10.2. Returns `None` if the signature
+/// (`û₀(11..6) == 0x3F`) or fixed trailer (`û₃(3..0) == 0`) doesn't
+/// match — caller should treat as erasure.
+pub fn parse_tone_frame(u: &[u16; 4]) -> Option<ToneFrameFields> {
+    // Signature check — required by §2.10.1.
+    if (u[0] >> 6) & 0x3F != 0x3F {
+        return None;
+    }
+    // Fixed trailer per Table 20.
+    if u[3] & 0x0F != 0 {
+        return None;
+    }
+    // I_D copy 4 — contiguous 8 bits in û₃(12..5).
+    let id = ((u[3] >> 5) & 0xFF) as u8;
+    // A_D: 6 MSBs in û₀(5..0) (= A_D(6..1)), LSB in û₃(4) (= A_D(0)).
+    let ad_hi = (u[0] & 0x3F) as u8; // bits 6..1
+    let ad_lo = ((u[3] >> 4) & 1) as u8; // bit 0
+    let amplitude = (ad_hi << 1) | ad_lo;
+    Some(ToneFrameFields { id, amplitude })
+}
+
+/// Encode a tone-frame's `(I_D, A_D)` into the prioritized 4-info-vector
+/// shape that goes into [`crate::halfrate::frame::encode_frame`].
+///
+/// Inverse of [`parse_tone_frame`] — produces û₀..û₃ with the §2.10.1
+/// signature (`û₀(11..6) = 0x3F`) and Table 20 layout (4 redundant
+/// copies of `I_D`, split-encoded `A_D`, fixed-zero trailer in
+/// `û₃(3..0)`). Caller feeds this directly to `encode_frame` to
+/// produce the 36-dibit / 9-byte FEC frame; the dequantize side will
+/// classify it as `FrameKind::Tone` and route through `parse_tone_frame`.
+///
+/// `id == 255` is the silence sentinel (zero-amplitude regardless of
+/// `amplitude`); other reserved IDs (`ANNEX_T[id] == None`) are encoded
+/// faithfully but `tone_to_mbe_params` will return `None` on decode.
+pub fn encode_tone_frame_info(id: u8, amplitude: u8) -> [u16; 4] {
+    let amplitude = amplitude & 0x7F; // 7-bit field
+    let mut u = [0u16; 4];
+    let ad_hi = (amplitude >> 1) & 0x3F;
+    let ad_lo = amplitude & 1;
+    // û₀: 0x3F signature in (11..6); A_D(6..1) in (5..0).
+    u[0] = (0x3F << 6) | u16::from(ad_hi);
+    // û₁: I_D copy 1 full 8 bits at (11..4); copy 2 MSB nibble at (3..0).
+    u[1] = (u16::from(id) << 4) | u16::from(id >> 4);
+    // û₂: copy 2 LSB nibble at (10..7); copy 3 top 7 bits at (6..0).
+    let id_lo_nibble = u16::from(id & 0x0F);
+    u[2] = (id_lo_nibble << 7) | u16::from(id >> 1);
+    // û₃: bit 13 = I_D(0); bits (12..5) = copy 4 full 8 bits;
+    //     bit 4 = A_D(0); bits (3..0) = 0 (fixed trailer).
+    u[3] = (u16::from(id & 1) << 13) | (u16::from(id) << 5) | (u16::from(ad_lo) << 4);
+    u
+}
+
+/// Convert `(I_D, A_D)` to `MbeParams` via the MBE bridge of Eq. 206–209.
+///
+/// Returns `None` for reserved `I_D` values (no row in `ANNEX_T`).
+/// For `I_D = 255` (silence) the amplitude is overridden to zero
+/// regardless of `A_D`.
+pub fn tone_to_mbe_params(id: u8, amplitude: u8) -> Option<MbeParams> {
+    let tone = ANNEX_T[id as usize]?;
+    let ToneParams { f0, l1, l2 } = tone;
+    let f0_f64 = f64::from(f0);
+    if f0_f64 <= 0.0 {
+        return None;
+    }
+    // Eq. 206–207: ω₀ and L̃ from f_0.
+    let omega_0 = (2.0 * PI64 / 8000.0) * f0_f64;
+    let l_tilde = (3812.5 / f0_f64).floor() as u8;
+    let l = l_tilde.clamp(crate::mbe_params::L_MIN, L_MAX);
+
+    // Eq. 208–209: voicing and magnitude at l_1 and l_2 only.
+    let mut voiced = [false; L_MAX as usize];
+    let mut amps = [0f32; L_MAX as usize];
+    let tone_magnitude = if id == 255 {
+        0.0 // silence override per §2.10.3 Step 3
+    } else {
+        TONE_AMPLITUDE_PEAK
+            * 10f64.powf(TONE_AMPLITUDE_EXPONENT_STEP * (f64::from(amplitude) - 127.0))
+    };
+    // Voicing and amplitudes are set on l_1 and l_2 if they're in-range.
+    for &l_tone in &[l1, l2] {
+        if l_tone >= 1 && l_tone <= l {
+            voiced[(l_tone - 1) as usize] = true;
+            amps[(l_tone - 1) as usize] = tone_magnitude as f32;
+        }
+    }
+
+    MbeParams::new(
+        omega_0 as f32,
+        l,
+        &voiced[..l as usize],
+        &amps[..l as usize],
+    )
+    .ok()
+}
+
+/// Fraction of the frame's harmonic energy that must sit in the two strongest
+/// harmonics before the frame is treated as a tone.
+///
+/// Annex T tones put all their energy on `l₁` and `l₂` and nothing anywhere
+/// else, so a genuine tone scores essentially 1.0 here; the margin below that
+/// only has to absorb the quantizer's own noise floor. Speech never comes
+/// close — even a strongly voiced vowel spreads energy across many harmonics.
+const TONE_ENERGY_CONCENTRATION: f64 = 0.9995;
+
+/// Recover `(I_D, A_D)` from parameters that describe a tone — the inverse of
+/// [`tone_to_mbe_params`], and `None` for anything that is not one.
+///
+/// This exists for the **full-rate to half-rate** direction. Full-rate IMBE has
+/// no tone signalling: a tone arrives as an ordinary voiced frame with its
+/// energy piled onto one or two harmonics. The half-rate wire *does* have tone
+/// frames, and the reference's own converter uses them — on the reference
+/// rate-conversion vectors it emits 587 tone frames out of 625 for a swept
+/// sine and 629 of 950 for the tone montage, where a converter without this
+/// step emits none. Re-encoding a tone as a voiced spectrum instead costs
+/// about 3 dB of log-spectral distortion on the sine vector, against a
+/// reference that degrades it by barely 1 dB.
+///
+/// The test is energy concentration ([`TONE_ENERGY_CONCENTRATION`]), not a
+/// harmonic count: a tone whose `l₁ == l₂` occupies a single harmonic, and one
+/// with two distinct components occupies two, so counting peaks would have to
+/// special-case both. Concentration covers them together.
+///
+/// Matching is by frequency rather than by harmonic index, because the source
+/// grid's `ω₀` and the tone's own `f₀` are unrelated: the same 1 kHz component
+/// is harmonic 5 of a 200 Hz grid and harmonic 8 of a 125 Hz one. Each
+/// candidate row is scored on where its components actually land in Hz.
+pub fn params_to_tone(p: &MbeParams) -> Option<(u8, u8)> {
+    let l = p.harmonic_count() as usize;
+    let amps = p.amplitudes_slice();
+    if l == 0 || amps.len() < l {
+        return None;
+    }
+    let omega_0 = f64::from(p.omega_0());
+    if !omega_0.is_finite() || omega_0 <= 0.0 {
+        return None;
+    }
+
+    // Energy, and the two strongest harmonics.
+    let mut total = 0.0f64;
+    let (mut i1, mut i2) = (0usize, 0usize);
+    let (mut e1, mut e2) = (-1.0f64, -1.0f64);
+    for (i, &a) in amps[..l].iter().enumerate() {
+        let e = f64::from(a) * f64::from(a);
+        total += e;
+        if e > e1 {
+            (e2, i2) = (e1, i1);
+            (e1, i1) = (e, i);
+        } else if e > e2 {
+            (e2, i2) = (e, i);
+        }
+    }
+    if total <= 0.0 || (e1 + e2.max(0.0)) / total < TONE_ENERGY_CONCENTRATION {
+        return None;
+    }
+
+    // Harmonic index k sits at k · ω₀, in Hz.
+    let hz = |idx: usize| (idx as f64 + 1.0) * omega_0 * 8000.0 / (2.0 * PI64);
+    // A single-component tone repeats its one frequency, which is exactly how
+    // Annex T stores it (`l₁ == l₂`).
+    let single = e2 <= 0.0 || e2 / e1 < 0.01;
+    let (f_a, f_b) = if single {
+        (hz(i1), hz(i1))
+    } else {
+        let (lo, hi) = if i1 < i2 { (i1, i2) } else { (i2, i1) };
+        (hz(lo), hz(hi))
+    };
+
+    // Closest Annex T row by summed frequency error. Silence (`I_D = 255`) is
+    // excluded: it carries no frequency and would match anything.
+    let mut best: Option<(f64, u8)> = None;
+    for (id, row) in ANNEX_T.iter().enumerate() {
+        if id == 255 {
+            continue;
+        }
+        let Some(ToneParams { f0, l1, l2 }) = *row else {
+            continue;
+        };
+        let f0 = f64::from(f0);
+        if f0 <= 0.0 {
+            continue;
+        }
+        let (c1, c2) = (f0 * f64::from(l1), f0 * f64::from(l2));
+        let err = (c1 - f_a).abs() + (c2 - f_b).abs();
+        if best.is_none_or(|(b, _)| err < b) {
+            best = Some((err, id as u8));
+        }
+    }
+    let (err, id) = best?;
+    // A tone the table cannot represent is better sent as voice than as the
+    // wrong tone: half the harmonic spacing is the point past which some other
+    // row is nearer.
+    let spacing = omega_0 * 8000.0 / (2.0 * PI64);
+    if err > spacing {
+        return None;
+    }
+
+    // Invert Eq. 209 for the amplitude index.
+    let peak = f64::from(amps[i1]).max(1e-9);
+    let a_d = (peak / TONE_AMPLITUDE_PEAK).log10() / TONE_AMPLITUDE_EXPONENT_STEP + 127.0;
+    Some((id, a_d.round().clamp(0.0, 255.0) as u8))
+}
+
+/// Top-level half-rate frame decoder that handles all three frame kinds.
+///
+/// - Voice: returns `Decoded::Voice(MbeParams)`, updates the
+///   `DecoderState` (γ̃, Λ̃, L̃(−1)).
+/// - Tone: returns `Decoded::Tone { fields, params }`. Does
+///   **not** update `prev_lambda`, `prev_l`, or `prev_gamma` — per
+///   §2.8.3 and §2.11, tone/silence/erasure frames do not advance
+///   voice-path state.
+/// - Erasure: returns `Decoded::Erasure`. Caller repeats the
+///   previous voice frame (or emits silence on cold start).
+pub fn decode_to_params(u: &[u16; 4], state: &mut DecoderState) -> Result<Decoded, DecodeError> {
+    match classify_frame(u) {
+        FrameKind::Voice => {
+            let params = dequantize(u, state)?;
+            Ok(Decoded::Voice(params))
+        }
+        FrameKind::Tone => {
+            let fields = parse_tone_frame(u).ok_or(DecodeError::BadPitch)?;
+            let params =
+                tone_to_mbe_params(fields.id, fields.amplitude).ok_or(DecodeError::BadPitch)?;
+            Ok(Decoded::Tone { fields, params })
+        }
+        FrameKind::Erasure => Ok(Decoded::Erasure),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// `params_to_tone` is the inverse of `tone_to_mbe_params`. Every Annex T
+    /// row that renders to parameters must be recognisable from them again,
+    /// and at the amplitude it was rendered with.
+    #[test]
+    fn params_to_tone_inverts_tone_to_mbe_params() {
+        let (mut checked, mut id_ok, mut amp_ok) = (0usize, 0usize, 0usize);
+        for id in 0u8..=254 {
+            for amplitude in [40u8, 96, 127, 160, 200] {
+                let Some(p) = tone_to_mbe_params(id, amplitude) else {
+                    continue;
+                };
+                checked += 1;
+                let Some((got_id, got_amp)) = params_to_tone(&p) else {
+                    continue;
+                };
+                // Distinct rows can share a frequency pair, so compare what is
+                // actually observable — where the components land — rather
+                // than the index.
+                let (a, b) = (
+                    ANNEX_T[id as usize].unwrap(),
+                    ANNEX_T[got_id as usize].unwrap(),
+                );
+                if (a.f0 * f32::from(a.l1) - b.f0 * f32::from(b.l1)).abs() < 1.0
+                    && (a.f0 * f32::from(a.l2) - b.f0 * f32::from(b.l2)).abs() < 1.0
+                {
+                    id_ok += 1;
+                }
+                if got_amp.abs_diff(amplitude) <= 1 {
+                    amp_ok += 1;
+                }
+            }
+        }
+        assert!(checked > 100, "expected a populated Annex T, saw {checked}");
+        assert_eq!(id_ok, checked, "tone frequency not recovered on every row");
+        assert_eq!(amp_ok, checked, "tone amplitude not recovered on every row");
+    }
+
+    /// The detector must reject anything with energy spread across the
+    /// spectrum, which is what separates speech from a tone.
+    #[test]
+    fn params_to_tone_rejects_broadband_spectra() {
+        for seed in 0..16u32 {
+            let omega_0 = 0.10 + (seed as f32) * 0.01;
+            let l = crate::mbe_params::MbeParams::harmonic_count_for(omega_0);
+            let voiced: Vec<bool> = (1..=l).map(|h| h % 2 == 0).collect();
+            let amps: Vec<f32> = (1..=l)
+                .map(|h| 3000.0 * (-(h as f32) * 0.05).exp() + 100.0)
+                .collect();
+            let p = crate::mbe_params::MbeParams::new(omega_0, l, &voiced, &amps).unwrap();
+            assert!(
+                params_to_tone(&p).is_none(),
+                "seed {seed}: a broadband spectrum was called a tone"
+            );
+        }
+    }
+
+    use super::*;
+
+    // ---- L = 56 override --------------------------------------------------
+
+    /// `L56_OMEGA_0` must be exactly `L56_STEP · 2π / 2¹⁹`, not a fitted
+    /// number. Also pins the step outside the Annex L table's range, which is
+    /// what makes the override a substitution rather than a pitch-table entry.
+    #[test]
+    fn l56_omega_0_is_derived_from_the_step() {
+        let want = (L56_STEP as f64) * 2.0 * PI64 / 524_288.0;
+        // Tolerance is f32 storage precision, not a fudge: |ω₀| ≈ 0.05, so one
+        // f32 ulp here is ≈ 4e-9.
+        assert!(
+            (f64::from(L56_OMEGA_0) - want).abs() < 1e-8,
+            "L56_OMEGA_0 {} != {want}",
+            L56_OMEGA_0
+        );
+        // ~64.35 Hz at 8 kHz.
+        let hz = want * 8000.0 / (2.0 * PI64);
+        assert!((hz - 64.3463).abs() < 1e-3, "{hz}");
+        // No Annex L entry pairs L = 56 with this ω₀.
+        for b0 in 0..=PITCH_INDEX_MAX {
+            let p = decode_pitch(b0).expect("in range");
+            assert!(
+                !(p.l == L56_L && (f64::from(p.omega_0) - want).abs() < 1e-6),
+                "b0={b0} duplicates the override"
+            );
+        }
+    }
+
+    /// The gate is structural, not a threshold. Fires iff no band carries
+    /// code 1 and some band carries code 2 — which over Annex M's 32 rows
+    /// selects exactly `b̂₁ ∈ {18..=31}`.
+    #[test]
+    fn l56_gate_is_the_codebook_predicate() {
+        for b1 in 0u8..32 {
+            let cb = &AMBE_VUV_CODEBOOK_16[b1 as usize];
+            let want = !cb.iter().any(|&c| c & 1 != 0) && cb.iter().any(|&c| c & 2 != 0);
+            assert_eq!(l56_gate_from_b1(b1), want, "b1={b1}");
+        }
+        let fired: Vec<u8> = (0u8..32).filter(|&b| l56_gate_from_b1(b)).collect();
+        assert_eq!(fired, (18u8..32).collect::<Vec<_>>());
+        // Out-of-range indices must not fire.
+        assert!(!l56_gate_from_b1(32));
+        assert!(!l56_gate_from_b1(255));
+    }
+
+    /// The flag must reach the decoded parameters, and must be inert when off.
+    #[test]
+    fn l56_override_changes_l_and_omega_only_when_gated() {
+        // A gated frame: b̂₁ = 20, any decodable b̂₀.
+        let mut u = [0u16; 4];
+        // Build a prioritized word set whose deprioritized b̂₀/b̂₁ we then read
+        // back, rather than assuming the packing.
+        for cand in 0u32..200_000 {
+            u[0] = (cand & 0xfff) as u16;
+            u[1] = ((cand >> 5) & 0xfff) as u16;
+            u[2] = ((cand >> 9) & 0x7ff) as u16;
+            u[3] = ((cand >> 3) & 0x3fff) as u16;
+            let b = deprioritize(&u);
+            if b[0] > u16::from(PITCH_INDEX_MAX) || !l56_gate_from_b1(b[1] as u8) {
+                continue;
+            }
+            let mut off = DecoderState::new();
+            let mut on = DecoderState::new();
+            on.set_l56_override(true);
+            let a = dequantize(&u, &mut off).expect("decode");
+            let c = dequantize(&u, &mut on).expect("decode");
+            assert_eq!(a.harmonic_count(), decode_pitch(b[0] as u8).unwrap().l);
+            assert_eq!(c.harmonic_count(), L56_L, "override did not set L");
+            assert!(
+                (c.omega_0() - L56_OMEGA_0).abs() < 1e-9,
+                "override did not set omega_0"
+            );
+            return;
+        }
+        panic!("no gated frame found -- the probe, not the code, is broken");
+    }
+
+    // ---- Pitch ------------------------------------------------------------
+
+    #[test]
+    fn pitch_decode_endpoints_match_annex_l() {
+        // The spec prints Annex L in cycles/sample; the table holds
+        // rad/sample.
+        use core::f32::consts::PI;
+        let p0 = decode_pitch(0).unwrap();
+        assert_eq!(p0.l, 9);
+        assert!((p0.omega_0 - 0.049971 * 2.0 * PI).abs() < 1e-5);
+        let p_last = decode_pitch(119).unwrap();
+        assert_eq!(p_last.l, 56);
+        assert!((p_last.omega_0 - 0.008125 * 2.0 * PI).abs() < 1e-5);
+    }
+
+    #[test]
+    fn pitch_decode_rejects_tone_and_reserved() {
+        for b0 in 120u8..=255 {
+            assert!(decode_pitch(b0).is_none(), "b̂₀ = {b0}");
+        }
+    }
+
+    // ---- V/UV -------------------------------------------------------------
+
+    #[test]
+    fn expand_vuv_all_voiced_codebook_0_gives_voiced() {
+        // AMBE_VUV_CODEBOOK[0] is all-voiced (verified in half_rate tests).
+        let v = expand_vuv(0, 0.2, 9);
+        for l_h in 0..9 {
+            assert!(v[l_h]);
+        }
+    }
+
+    #[test]
+    fn expand_vuv_all_unvoiced_codebook_16_gives_unvoiced() {
+        let v = expand_vuv(16, 0.2, 9);
+        for l_h in 0..9 {
+            assert!(!v[l_h]);
+        }
+    }
+
+    /// The closed-form the reference floor rule must regenerate every Annex L row.
+    /// This is what makes [`encode_pitch_reference`] arithmetic rather than table
+    /// data, so it is the load-bearing test for that claim.
+    #[test]
+    fn reference_pitch_quantizer_reproduces_annex_l() {
+        let mut hit = 0usize;
+        for (b0, entry) in AMBE_PITCH_TABLE.iter().enumerate() {
+            let got = encode_pitch_reference(entry.omega_0)
+                .unwrap_or_else(|| panic!("b0={b0} rejected as out of band"));
+            assert_eq!(
+                got as usize, b0,
+                "Annex L row {b0} (ω₀={}) round-trips to {got}",
+                entry.omega_0
+            );
+            hit += 1;
+        }
+        assert_eq!(hit, 120, "Annex L must have 120 rows");
+    }
+
+    /// The nearest-neighbour rule and the reference floor rule disagree on a large
+    /// fraction of inputs, and the disagreement is **entirely one-sided** —
+    /// `encode_pitch` is systematically one index high, never one index low.
+    ///
+    /// A one-sided error is a bias we can correct; a two-sided one would be
+    /// noise. Locking the sign down is the point of this test.
+    #[test]
+    fn reference_pitch_quantizer_divergence_is_one_sided() {
+        let first = f64::from(AMBE_PITCH_TABLE[0].omega_0);
+        let last = f64::from(AMBE_PITCH_TABLE[AMBE_PITCH_TABLE.len() - 1].omega_0);
+
+        let n = 40_000u32;
+        let (mut disagree, mut wrong_sign) = (0u32, 0u32);
+        for i in 0..n {
+            // Deterministic sweep across the band; no rng dependency.
+            let frac = f64::from(i) / f64::from(n - 1);
+            let omega = (last + (first - last) * frac) as f32;
+            let (Some(nn), Some(dv)) = (encode_pitch(omega), encode_pitch_reference(omega)) else {
+                continue;
+            };
+            if nn != dv {
+                disagree += 1;
+                if i16::from(dv) - i16::from(nn) != 1 {
+                    wrong_sign += 1;
+                }
+            }
+        }
+        assert_eq!(
+            wrong_sign, 0,
+            "every divergence must be exactly -1 (nearest-neighbour reads low)"
+        );
+        let pct = 100.0 * f64::from(disagree) / f64::from(n);
+        assert!(
+            (15.0..40.0).contains(&pct),
+            "expected a substantial one-sided divergence, got {pct:.2}%"
+        );
+    }
+
+    /// Annex M is a 5-bit VQ, so all 32 codewords must be distinct.
+    /// [`AMBE_VUV_CODEBOOK`] holds only 13 distinct payloads — 16 of the 32 rows
+    /// are byte-identical all-false. That degeneracy is a real defect, but not
+    /// for the reason "8 of 16 bands" suggests, so read on before acting.
+    ///
+    /// **The 16 fields of [`AMBE_VUV_CODEBOOK_16`] are 2 blocks × 8 bands, not
+    /// 16 frequency bands.** Fields 0..7 are the current block's eight bands in
+    /// ascending frequency; fields 8..15 are the interpolated synthesis block's.
+    /// So [`expand_vuv`] reading fields 0..7 with `j` clamped to 7 is addressing
+    /// the correct coded-band index — it is *not* discarding the top half of the
+    /// spectrum. What it is missing is the engine's adjacent-band OR
+    /// (`bands[lo] | bands[min(lo + 1, 15)]`, 3 folded back to 1).
+    ///
+    /// **Per-band alphabet, resolved against the engine:** `0` = unvoiced
+    /// (noise-excited), `1` = voiced and pitch-tracked, `2` = voiced at a fixed
+    /// frequency with no pitch trajectory, which is also the marker that arms
+    /// the dual-tone / `L = 56` grid path. Both nonzero codes are voiced. The
+    /// apparent conflict between `VOICING_PATTERNS[0] == 0x5555_5555` and
+    /// `voiced_offset`'s `0xaaaa_aaaa` is not a representation mismatch across
+    /// `expand_dibits` (which is value-preserving per dibit): the two masks ask
+    /// different questions of the same word — `& 0x5555_5555` is "any band at
+    /// code 1", `& 0xaaaa_aaaa` is "any band at code 2". Code 2 is **not**
+    /// stateful; the "reuse the previous frame's decision" rule lives only in
+    /// the IMBE expander `voicing_pattern`, whereas the AMBE path goes through
+    /// `voicing_from_table`, a pure lookup. [`expand_vuv`] can stay a pure
+    /// function of `(b̂₁, ω̃₀, L)`.
+    ///
+    /// The table correspondence is settled: unpacked as 16 two-bit fields, row
+    /// `i` of [`AMBE_VUV_CODEBOOK_16`] is exactly
+    /// `crate::engine::tables::VOICING_PATTERNS[4 * i]` for all 32 rows, which
+    /// the engine's own `voicing_from_table` index arithmetic confirms
+    /// (`idx << (7 - sh)`, `sh = 5` for a 5-bit index).
+    ///
+    /// **What the degeneracy actually costs.** Rows 18..25 lose code-2 content
+    /// inside bands 0..7; rows 17 and 26..31 carry content only in the second
+    /// block's fields. Because rows 16..31 are then byte-identical, the
+    /// `if d < best_d` tie-break in [`encode_vuv`] makes index 16 win every
+    /// search, so this crate **never emits `b̂₁ ≥ 17`** — 0 of 1637 converted
+    /// frames — while the reference emits that range in 16.40% of frames
+    /// (268 of 1634). Those frames are structurally impossible for us to match,
+    /// capping full→half frame-exactness near 83.6%, and they carry ~95% of all
+    /// pitch-field error via the `L = 56` grid override.
+    ///
+    /// **Reachability alone is not the fix, and measures worse.** Making rows
+    /// 17..31 reachable on their own costs speech quality — full→half 11.70 →
+    /// 12.22 dB, half→full 8.80 → 9.35 dB. The
+    /// reference selects those rows from a spectral tonality measurement a
+    /// parameter-domain converter does not have, and emitting one also requires
+    /// reinterpreting the pitch field as a joint tone-frequency code on a forced
+    /// 56-harmonic grid. It is a tone-path problem wearing a voicing-table
+    /// costume.
+    ///
+    /// Measured control: the gain/PRBA/HOC error is **not** downstream of this.
+    /// On frames where our `b̂₁` matches the reference's and is `< 16` — voicing
+    /// provably identical, no degenerate row involved — gain still differs in
+    /// 80.6% of frames, against 82.9% overall.
+    ///
+    /// This test stays ignored, and fails, until the tone path is addressed —
+    /// it is the guard against the degeneracy surviving unnoticed.
+    #[test]
+    #[ignore = "rows 16..31 are degenerate; a tone-path fix, not a table swap — see the doc comment"]
+    fn annex_m_codewords_are_all_distinct() {
+        let mut seen: std::collections::HashMap<&[bool; 8], usize> =
+            std::collections::HashMap::new();
+        let mut dupes: Vec<(usize, usize)> = Vec::new();
+        for (i, row) in AMBE_VUV_CODEBOOK.iter().enumerate() {
+            match seen.get(row) {
+                Some(&first) => dupes.push((first, i)),
+                None => {
+                    seen.insert(row, i);
+                }
+            }
+        }
+        assert!(
+            dupes.is_empty(),
+            "Annex M must have 32 distinct codewords, found {} distinct; \
+             duplicate pairs (first, dup): {:?}",
+            seen.len(),
+            dupes,
+        );
+    }
+
+    #[test]
+    fn expand_vuv_j_l_clamps_to_seven() {
+        // For a high pitch and high l, j_l = floor(l·16·ω/(2π)) should
+        // hit the 7 clamp. Check: ω = 2π/19.875, l = 9
+        //   j = floor(9 · 16 / 19.875) = floor(7.245) = 7 → clamp ok.
+        let omega = 2.0 * core::f32::consts::PI / 19.875;
+        let _ = expand_vuv(0, omega, 9);
+        // With all-voiced codebook (b1=0), all harmonics are voiced
+        // regardless of j_l; the test just exercises the clamp path.
+    }
+
+    // ---- Gain -------------------------------------------------------------
+
+    #[test]
+    fn decode_gain_first_frame_equals_table_level() {
+        // With prev_gamma = 0, γ̃(0) = Δ̃_γ = AMBE_GAIN_LEVELS[b2].
+        assert!((decode_gain(0, 0.0) - (-2.0)).abs() < 1e-6);
+        assert!((decode_gain(31, 0.0) - 6.874496).abs() < 1e-6);
+    }
+
+    #[test]
+    fn decode_gain_differential_recurrence() {
+        // γ̃(0) = Δ̃_γ + 0.5·γ̃(−1).
+        let g0 = decode_gain(16, 10.0);
+        let d16 = AMBE_GAIN_LEVELS[16] as f64;
+        assert!((g0 - (d16 + 5.0)).abs() < 1e-6);
+    }
+
+    // ---- PRBA -------------------------------------------------------------
+
+    #[test]
+    fn prba_vector_sources_from_correct_codebooks() {
+        // b3 = 0 → PRBA24[0] = [0.526055, -0.328567, -0.304727]
+        // b4 = 0 → PRBA58[0] = [-0.103660, 0.094597, -0.013149, 0.081501]
+        let g = decode_prba_vector(0, 0);
+        assert_eq!(g[0], 0.0);
+        assert!((g[1] - 0.526055).abs() < 1e-6);
+        assert!((g[2] - (-0.328567)).abs() < 1e-6);
+        assert!((g[3] - (-0.304727)).abs() < 1e-6);
+        assert!((g[4] - (-0.103660)).abs() < 1e-6);
+        assert!((g[5] - 0.094597).abs() < 1e-6);
+        assert!((g[6] - (-0.013149)).abs() < 1e-6);
+        assert!((g[7] - 0.081501).abs() < 1e-6);
+    }
+
+    #[test]
+    fn prba_dc_only_propagates_to_all_residuals() {
+        // G̃ = (c, 0, 0, 0, 0, 0, 0, 0) → R̃_i = c for all i
+        // (same argument as the full-rate version of this test).
+        // But G̃₁ is always forced to 0 in decode_prba_vector, so we
+        // build g directly.
+        let g = [3.0f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let r = prba_to_residuals(&g);
+        for i in 0..8 {
+            assert!((r[i] - 3.0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn pair_split_matches_encoder_inverse() {
+        // Encoder (§13.3.1): R̂_{2i-1} = Ĉ_{i,1} + √2·Ĉ_{i,2};
+        //                   R̂_{2i}   = Ĉ_{i,1} − √2·Ĉ_{i,2}.
+        // Decoder pair_split must invert this on any C̃.
+        let c_in: [(f64, f64); 4] = [(1.5, 0.3), (2.0, -0.5), (-1.0, 0.7), (0.5, -0.2)];
+        let mut r = [0f64; 8];
+        for i in 0..4 {
+            r[2 * i] = c_in[i].0 + core::f64::consts::SQRT_2 * c_in[i].1;
+            r[2 * i + 1] = c_in[i].0 - core::f64::consts::SQRT_2 * c_in[i].1;
+        }
+        let c_out = pair_split(&r);
+        for i in 0..4 {
+            assert!((c_out[i].0 - c_in[i].0).abs() < 1e-12, "block {i} mean");
+            assert!((c_out[i].1 - c_in[i].1).abs() < 1e-12, "block {i} k=2");
+        }
+    }
+
+    // ---- HOC placement (Reading #1) --------------------------------------
+
+    #[test]
+    fn hoc_matrix_respects_block_length_clamp() {
+        // For L̃ = 9, Annex N gives blocks = (2, 2, 2, 3). So:
+        //   block 1: J̃=2 → HOC range k=3..=min(2,6) = empty; k=1,2 only.
+        //   block 4: J̃=3 → HOC range k=3..=3 = {3} → C̃_{4,3} = H̃_{4,1}.
+        let pair = [(1.0, 0.1), (2.0, 0.2), (3.0, 0.3), (4.0, 0.4)];
+        let blocks = [2u8, 2, 2, 3];
+        let c = assemble_hoc_matrix(&pair, 0, 0, 0, 0, &blocks);
+        // Block 4 (i=3): means + k=2 + H̃_{4,1} at k=3.
+        assert_eq!(c[3][0], 4.0);
+        assert_eq!(c[3][1], 0.4);
+        assert!((c[3][2] - f64::from(AMBE_HOC_B8[0][0])).abs() < 1e-6);
+        // Blocks 1–3 (i=0,1,2): J̃=2 → only k=1,2 populated, k=3..16 zero.
+        for i in 0..3 {
+            for k in 2..MAX_BLOCK_SIZE {
+                assert_eq!(c[i][k], 0.0, "block {i}, k_idx {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn hoc_matrix_fills_up_to_k_six_when_block_is_large() {
+        // J̃ = 17 (max) → k = 3..=6 all populated from HOC[i][1..=4]
+        //                 → C̃[i][2..=5], rest zero up to 16.
+        let pair = [(0.0, 0.0); 4];
+        let blocks = [17u8, 17, 11, 11]; // contrived; sum doesn't matter for this test
+        let c = assemble_hoc_matrix(&pair, 0, 0, 0, 0, &blocks);
+        // Block 1 (i=0, B5): k=3..=6 → C̃_{1,3}..C̃_{1,6}.
+        for k in 3..=6 {
+            let expected = f64::from(AMBE_HOC_B5[0][k - 3]);
+            assert!((c[0][k - 1] - expected).abs() < 1e-6, "block 1, k={k}");
+        }
+        // Coefficients beyond k=6 are zero.
+        for k in 7..MAX_BLOCK_SIZE {
+            assert_eq!(c[0][k - 1], 0.0, "block 1, k_idx {k}");
+        }
+    }
+
+    // ---- Per-block inverse DCT -------------------------------------------
+
+    #[test]
+    fn inverse_block_dct_dc_only_propagates() {
+        // Same test as the full-rate version: block means as the only
+        // non-zero coefficient → c̃_{i,j} = mean for all j.
+        let mut c = [[0f64; MAX_BLOCK_SIZE]; 4];
+        c[0][0] = 1.0;
+        c[1][0] = 2.0;
+        c[2][0] = 3.0;
+        c[3][0] = 4.0;
+        let blocks = AMBE_BLOCK_LENGTHS[0]; // L=9: [2, 2, 2, 3]
+        let t = inverse_block_dct(&c, &blocks);
+        let mut offset = 0;
+        for (i, &j) in blocks.iter().enumerate() {
+            for k in 0..j as usize {
+                assert!(
+                    (t[offset + k] - f64::from(i as u32 + 1)).abs() < 1e-9,
+                    "block {i}, pos {k}"
+                );
+            }
+            offset += j as usize;
+        }
+    }
+
+    // ---- Log-mag prediction ----------------------------------------------
+
+    #[test]
+    fn log_mag_prediction_with_unit_prev_and_zero_gamma() {
+        // Γ̃ = −0.5·log₂(L) − (1/L)·Σ T̃, so Λ̃_l(0) = T̃_l + Γ̃.
+        let mut t = [0f64; L_MAX as usize];
+        for i in 0..9 {
+            t[i] = (i as f64) * 0.1;
+        }
+        let state = DecoderState::new();
+        // §2.13's "Λ̃_l(−1) = 1" does not say whether that 1 is the log₂
+        // or the linear value, and the full-rate analog (§1.8.5,
+        // "M̃_l(−1) = 1", linear) does not settle it either. This test is
+        // domain-agnostic: `prev_lambda_at` returns the same constant for
+        // every l, so the predictor contributes 0.65·(1−δ) + 0.65·δ = 0.65
+        // per term, the per-harmonic subtract-mean cancels it, and
+        // Λ̃_l(0) = T̃_l + Γ̃ under either reading.
+        let lambda = apply_log_prediction(&t, 9, 0.0, &state);
+        let l_curr = 9f64;
+        let t_sum: f64 = t[..9].iter().sum();
+        let gamma_intercept = 0.0 - 0.5 * l_curr.log2() - t_sum / l_curr;
+        for l_h in 1..=9 {
+            let expected = t[l_h - 1] + gamma_intercept;
+            assert!(
+                (lambda[l_h] - expected).abs() < 1e-9,
+                "l={l_h}: expected {expected}, got {}",
+                lambda[l_h]
+            );
+        }
+    }
+
+    // ---- Top-level -------------------------------------------------------
+
+    #[test]
+    fn dequantize_rejects_tone_frame() {
+        use crate::halfrate::priority::prioritize;
+        let mut b = [0u16; 9];
+        b[0] = 120; // tone frame
+        let u = prioritize(&b);
+        let mut state = DecoderState::new();
+        assert_eq!(dequantize(&u, &mut state), Err(DecodeError::BadPitch));
+    }
+
+    #[test]
+    fn dequantize_produces_finite_amplitudes_for_zero_b() {
+        use crate::halfrate::priority::prioritize;
+        // b̂₀ = 0 → valid pitch; other params zero.
+        let b = [0u16; 9];
+        let u = prioritize(&b);
+        let mut state = DecoderState::new();
+        let p = dequantize(&u, &mut state).expect("decode");
+        assert_eq!(p.harmonic_count(), 9);
+        assert!((p.omega_0() - 0.049971 * 2.0 * core::f32::consts::PI).abs() < 1e-5);
+        // All harmonics finite, non-negative.
+        for l_h in 1..=9 {
+            let a = p.amplitude(l_h);
+            assert!(a.is_finite() && a >= 0.0, "l={l_h}: M̃ = {a}");
+        }
+        // State updated.
+        assert_eq!(state.previous_l(), 9);
+    }
+
+    // ---- §2.10 tone frames -----------------------------------------------
+
+    fn build_tone_frame_u(id: u8, amplitude: u8) -> [u16; 4] {
+        // Build a half-rate info bundle per §2.10.1 Table 20:
+        //   û₀(11..6) = 0x3F        (signature)
+        //   û₀(5..0)  = A_D(6..1)   (amplitude bits 6..1)
+        //   û₁ carries I_D copy 1 and partial copy 2 — mirrors §2.10.2
+        //   û₂ carries partial copies 2 and 3
+        //   û₃ : I_D copy 3 LSB, I_D copy 4, A_D(0), fixed 0000
+        let mut u = [0u16; 4];
+        let ad_hi = (amplitude >> 1) & 0x3F;
+        let ad_lo = amplitude & 1;
+        u[0] = (0x3F << 6) | u16::from(ad_hi);
+        // û₁: copy 1 full 8 bits at (11..4); copy 2 MSB nibble at (3..0).
+        u[1] = (u16::from(id) << 4) | u16::from(id >> 4);
+        // û₂: copy 2 LSB nibble at (10..7); copy 3 top 7 bits at (6..0).
+        let id_lo_nibble = u16::from(id & 0x0F);
+        u[2] = (id_lo_nibble << 7) | u16::from(id >> 1);
+        // û₃: bit 13 = I_D(0); bits (12..5) = copy 4 full 8 bits; bit 4 = A_D(0).
+        u[3] = (u16::from(id & 1) << 13) | (u16::from(id) << 5) | (u16::from(ad_lo) << 4);
+        u
+    }
+
+    #[test]
+    fn classify_voice_frame_when_b0_valid() {
+        use crate::halfrate::priority::prioritize;
+        let b = [0u16; 9];
+        let u = prioritize(&b);
+        assert_eq!(classify_frame(&u), FrameKind::Voice);
+    }
+
+    #[test]
+    fn classify_erasure_for_b0_range_120_125() {
+        use crate::halfrate::priority::prioritize;
+        for b0 in 120..=125u16 {
+            let mut b = [0u16; 9];
+            b[0] = b0;
+            let u = prioritize(&b);
+            // Without the tone signature in û₀, this classifies as Erasure
+            // (the 120–125 range is specifically erasure per §13.1 Table 14).
+            assert_eq!(classify_frame(&u), FrameKind::Erasure, "b̂₀ = {b0}");
+        }
+    }
+
+    #[test]
+    fn classify_tone_for_b0_126_and_127_with_signature() {
+        let u = build_tone_frame_u(128, 0); // DTMF tone 0 (ID 128)
+        assert_eq!(classify_frame(&u), FrameKind::Tone);
+    }
+
+    #[test]
+    fn classify_erasure_when_tone_range_but_signature_missing() {
+        use crate::halfrate::priority::prioritize;
+        let mut b = [0u16; 9];
+        b[0] = 126; // tone-range b̂₀ but no signature
+        let u = prioritize(&b);
+        // With this synthetic frame, û₀ doesn't have the 0x3F
+        // signature — caller should fall back to Erasure.
+        assert_eq!(classify_frame(&u), FrameKind::Erasure);
+    }
+
+    #[test]
+    fn parse_tone_frame_recovers_id_and_amplitude() {
+        for id in [5u8, 64, 128, 144, 162, 255] {
+            for amp in [0u8, 1, 63, 64, 126, 127] {
+                let u = build_tone_frame_u(id, amp);
+                let fields = parse_tone_frame(&u)
+                    .unwrap_or_else(|| panic!("parse failed for id={id}, amp={amp}"));
+                assert_eq!(fields.id, id, "id={id} amp={amp}");
+                assert_eq!(fields.amplitude, amp, "id={id} amp={amp}");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_tone_frame_rejects_bad_signature() {
+        let mut u = build_tone_frame_u(128, 64);
+        u[0] &= !(0x3F << 6); // wipe the signature
+        assert_eq!(parse_tone_frame(&u), None);
+    }
+
+    #[test]
+    fn parse_tone_frame_rejects_bad_trailer() {
+        let mut u = build_tone_frame_u(128, 64);
+        u[3] |= 0x01; // set a trailer bit to non-zero
+        assert_eq!(parse_tone_frame(&u), None);
+    }
+
+    // ---- Tone → MBE bridge (§2.10.3) -------------------------------------
+
+    #[test]
+    fn tone_to_mbe_single_freq_tone() {
+        // ID = 5: f0 = 156.25 Hz, l1 = l2 = 1.
+        let params = tone_to_mbe_params(5, 127).unwrap();
+        // ω̃₀ = 2π·156.25/8000 = π/25.6
+        let expected_omega = (2.0 * core::f64::consts::PI / 8000.0) * 156.25;
+        assert!((f64::from(params.omega_0()) - expected_omega).abs() < 1e-6);
+        // L̃ = floor(3812.5 / 156.25) = 24, clamped to [9, 56]. So L=24.
+        assert_eq!(params.harmonic_count(), 24);
+        // Only l=1 should be voiced with non-zero amplitude (A_D=127 → peak=16384).
+        assert!(params.voiced(1));
+        assert!((params.amplitude(1) - 16384.0).abs() < 1.0);
+        for l_h in 2..=24 {
+            assert!(!params.voiced(l_h));
+            assert_eq!(params.amplitude(l_h), 0.0);
+        }
+    }
+
+    #[test]
+    fn tone_to_mbe_silence_id_255_has_zero_amplitude() {
+        // ID = 255 forces M̃_l = 0 regardless of A_D per §2.10.3 Step 3.
+        let params = tone_to_mbe_params(255, 127).unwrap();
+        for l_h in 1..=params.harmonic_count() {
+            assert_eq!(params.amplitude(l_h), 0.0, "l={l_h}");
+        }
+    }
+
+    #[test]
+    fn tone_to_mbe_reserved_id_returns_none() {
+        // Reserved range: 0..4 and 164..254.
+        for id in [0u8, 1, 4, 123, 164, 200, 254] {
+            assert!(tone_to_mbe_params(id, 64).is_none(), "id={id}");
+        }
+    }
+
+    #[test]
+    fn tone_to_mbe_two_freq_dtmf() {
+        // DTMF tone (ID = 128 → DTMF '1' or similar). Annex T row
+        // should have l1 != l2. Verify both are voiced and others aren't.
+        let params = tone_to_mbe_params(128, 100).unwrap();
+        let l = params.harmonic_count();
+        // Can't hard-code the DTMF indices without a copy of Annex T
+        // row values; just check that exactly two harmonics are voiced.
+        let voiced_count: usize = (1..=l).filter(|&i| params.voiced(i)).count();
+        assert!(
+            voiced_count <= 2,
+            "DTMF tone should activate at most 2 harmonics, got {voiced_count}"
+        );
+    }
+
+    #[test]
+    fn tone_amplitude_scales_logarithmically() {
+        // A_D drop of 1 step = 0.711 dB = factor of 10^{-0.03555}.
+        let step = 10f64.powf(-0.03555);
+        let p127 = tone_to_mbe_params(5, 127).unwrap();
+        let p126 = tone_to_mbe_params(5, 126).unwrap();
+        let a127 = f64::from(p127.amplitude(1));
+        let a126 = f64::from(p126.amplitude(1));
+        assert!(
+            (a126 / a127 - step).abs() < 1e-4,
+            "a126/a127 = {}",
+            a126 / a127
+        );
+    }
+
+    // ---- Top-level dispatch ---------------------------------------------
+
+    #[test]
+    fn decode_ambe_plus2_dispatches_voice() {
+        use crate::halfrate::priority::prioritize;
+        let b = [0u16; 9];
+        let u = prioritize(&b);
+        let mut state = DecoderState::new();
+        match decode_to_params(&u, &mut state).unwrap() {
+            Decoded::Voice(_) => {}
+            other => panic!("expected Voice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_ambe_plus2_dispatches_tone() {
+        let u = build_tone_frame_u(5, 100); // 156.25 Hz tone
+        let mut state = DecoderState::new();
+        match decode_to_params(&u, &mut state).unwrap() {
+            Decoded::Tone { fields, params: _ } => {
+                assert_eq!(fields.id, 5);
+                assert_eq!(fields.amplitude, 100);
+            }
+            other => panic!("expected Tone, got {other:?}"),
+        }
+        // Tone frame must not advance voice-state.
+        assert_eq!(state.previous_l(), INIT_PREV_L);
+        assert_eq!(state.previous_gamma(), 0.0);
+    }
+
+    #[test]
+    fn decode_ambe_plus2_dispatches_erasure() {
+        use crate::halfrate::priority::prioritize;
+        let mut b = [0u16; 9];
+        b[0] = 120; // erasure
+        let u = prioritize(&b);
+        let mut state = DecoderState::new();
+        match decode_to_params(&u, &mut state).unwrap() {
+            Decoded::Erasure => {}
+            other => panic!("expected Erasure, got {other:?}"),
+        }
+    }
+
+    // ---- Half-rate encoder ----------------------------------------------
+
+    #[test]
+    fn pitch_encode_roundtrips_every_table_entry() {
+        for b0 in 0..=119u8 {
+            let w = AMBE_PITCH_TABLE[b0 as usize].omega_0;
+            assert_eq!(encode_pitch(w), Some(b0), "b0 = {b0}");
+        }
+    }
+
+    #[test]
+    fn pitch_encode_rejects_out_of_range() {
+        assert_eq!(encode_pitch(0.0), None);
+        assert_eq!(encode_pitch(-0.1), None);
+        assert_eq!(encode_pitch(1.0), None); // higher than max ω₀ ≈ 0.05
+    }
+
+    #[test]
+    fn vuv_encode_all_voiced_selects_codebook_row_0() {
+        // AMBE_VUV_CODEBOOK[0] is all-voiced; per-harmonic all-voiced
+        // input should encode to it.
+        let voiced = vec![true; 9];
+        assert_eq!(encode_vuv(&voiced, 0.2), 0);
+    }
+
+    #[test]
+    fn vuv_encode_all_unvoiced_picks_row_with_unvoiced_at_active_slots() {
+        // With don't-care semantics on inactive slots, the encoder
+        // picks the LOWEST codebook row that has unvoiced at every
+        // active slot — which may be a mixed row, not necessarily
+        // row 16. We verify the picked row's active slots ARE all
+        // unvoiced, matching the input.
+        let voiced = vec![false; 9];
+        let omega_0 = 0.2f32;
+        let idx = encode_vuv(&voiced, omega_0);
+        // Re-decode and check per-harmonic output is all unvoiced.
+        let expanded = expand_vuv(idx, omega_0, 9);
+        for l_h in 0..9 {
+            assert!(
+                !expanded[l_h],
+                "l={l_h} should decode unvoiced for encoded b̂₁={idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn gain_encode_roundtrips_every_annex_o_level() {
+        for b2 in 0..32u8 {
+            let target = f64::from(AMBE_GAIN_LEVELS[b2 as usize]);
+            assert_eq!(encode_gain(target), b2, "b2 = {b2}");
+        }
+    }
+
+    #[test]
+    fn gain_encode_clamps_out_of_range() {
+        assert_eq!(encode_gain(-1000.0), 0);
+        assert_eq!(encode_gain(1000.0), 31);
+    }
+
+    #[test]
+    fn pair_join_inverts_pair_split() {
+        let r_in: [f64; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let pair = pair_split(&r_in);
+        let r_out = pair_join(&pair);
+        for i in 0..8 {
+            assert!((r_out[i] - r_in[i]).abs() < 1e-9, "i={i}");
+        }
+    }
+
+    #[test]
+    fn residuals_to_prba_inverts_prba_to_residuals() {
+        // Arbitrary R̃ → G̃ → R̃ round-trip. G̃₁ doesn't roundtrip
+        // because the decoder forces it to 0, but the forward DCT
+        // itself is exactly invertible.
+        let r_in: [f64; 8] = [0.5, 1.5, -0.3, 0.7, -1.2, 0.8, 0.0, 2.1];
+        let g = residuals_to_prba(&r_in);
+        let r_out = prba_to_residuals(&g);
+        for i in 0..8 {
+            assert!(
+                (r_out[i] - r_in[i]).abs() < 1e-9,
+                "i={i}: {} vs {}",
+                r_out[i],
+                r_in[i]
+            );
+        }
+    }
+
+    #[test]
+    fn forward_block_dct_inverts_inverse_block_dct() {
+        // For each of 4 blocks, forward DCT should invert the decoder's.
+        let blocks = AMBE_BLOCK_LENGTHS[(30 - 9) as usize]; // L=30
+        let l = 30u8;
+        let mut t_in = [0f64; L_MAX as usize];
+        for i in 0..l as usize {
+            t_in[i] = (i as f64 * 0.3).sin() * 2.0 - 0.5;
+        }
+        let c = forward_block_dct(&t_in, &blocks);
+        let t_out = inverse_block_dct(&c, &blocks);
+        for i in 0..l as usize {
+            assert!(
+                (t_out[i] - t_in[i]).abs() < 1e-6,
+                "i={i}: {} vs {}",
+                t_out[i],
+                t_in[i]
+            );
+        }
+    }
+
+    #[test]
+    fn quantize_prba_produces_valid_indices() {
+        let g: [f64; 8] = [0.0, 0.5, -0.3, 0.2, -0.1, 0.4, 0.0, -0.2];
+        let (b3, b4) = quantize_prba(&g);
+        assert!(b3 < 512);
+        assert!(b4 < 128);
+    }
+
+    #[test]
+    fn forward_log_prediction_inverts_apply_under_quantized_gamma() {
+        // Build an arbitrary Λ̃, push through forward log-mag pred to
+        // get T̃ + γ̃, then run the decoder's apply_log_prediction on T̃
+        // with the same state (and γ̃ feeding Γ̃). Should recover Λ̃.
+        let state = DecoderState::new();
+        let l = 20u8;
+        let mut lambda_in = [0f64; L_MAX as usize + 2];
+        for i in 1..=l as usize {
+            lambda_in[i] = (i as f64 * 0.15).sin() * 0.4 - 0.1;
+        }
+        let (t, gamma) = forward_log_prediction(&lambda_in, l, &state);
+        let lambda_out = apply_log_prediction(&t, l, gamma, &state);
+        for i in 1..=l as usize {
+            assert!(
+                (lambda_out[i] - lambda_in[i]).abs() < 1e-6,
+                "i={i}: {} vs {}",
+                lambda_out[i],
+                lambda_in[i]
+            );
+        }
+    }
+
+    #[test]
+    fn quantize_pitch_and_vuv_roundtrip_on_boundary_cases() {
+        // Bit-exact roundtrip is only well-defined for V/UV codebook
+        // rows that are fully determined by the active harmonic slots.
+        // For half-rate's low pitches, only 2–3 of the codebook's 8
+        // `j_l` slots are addressed by any given frame's harmonics,
+        // so rows that agree on the active slots but differ in the
+        // empty ones cannot be distinguished at dequantize. The
+        // all-voiced (row 0) and all-unvoiced (row 16) rows are
+        // stable endpoints — any per-harmonic pattern derived from
+        // those unambiguously maps back to the same row.
+        use crate::halfrate::priority::{deprioritize, prioritize};
+
+        // Only b̂₁ = 0 (all voiced) is guaranteed to be the lowest
+        // codebook index matching any all-voiced active-slot pattern.
+        // Row 16 (all unvoiced) is NOT the lowest such row — some
+        // mixed rows at indices 1..15 also have unvoiced bits at the
+        // low slots typical for half-rate pitches and would win the
+        // argmin tie-break. This is an inherent encoder ambiguity, not
+        // a bug: the decoder can't distinguish these rows either.
+        for &(b0_seed, b1_seed) in &[(50u16, 0u16), (0, 0), (119, 0), (60, 0)] {
+            let mut b = [0u16; 9];
+            b[0] = b0_seed;
+            b[1] = b1_seed;
+            let u = prioritize(&b);
+
+            let mut state_dec = DecoderState::new();
+            let params = dequantize(&u, &mut state_dec).unwrap();
+
+            let mut state_enc = DecoderState::new();
+            let u_back = quantize(&params, &mut state_enc).unwrap();
+            let b_back = deprioritize(&u_back);
+
+            assert_eq!(
+                b_back[0], b[0],
+                "b̂₀ pitch (seed b0={b0_seed}, b1={b1_seed})"
+            );
+            assert_eq!(b_back[1], b[1], "b̂₁ V/UV (seed b0={b0_seed}, b1={b1_seed})");
+        }
+    }
+
+    #[test]
+    fn quantize_gain_stabilizes_under_iterated_roundtrip() {
+        // Gain (b̂₂) uses a differential quantizer, so the first
+        // roundtrip may produce drift as the encoder recomputes γ̃
+        // from decoded M̃_l. Iterating a few times should stabilize.
+        use crate::halfrate::priority::{deprioritize, prioritize};
+        let mut b = [0u16; 9];
+        b[0] = 0;
+        b[1] = 0;
+        b[2] = 10;
+
+        let u0 = prioritize(&b);
+        let mut state_a = DecoderState::new();
+        let mut state_b = DecoderState::new();
+
+        // Frame 1: dequantize → params → re-encode.
+        let params = dequantize(&u0, &mut state_a).unwrap();
+        let u1 = quantize(&params, &mut state_b).unwrap();
+        let b1 = deprioritize(&u1);
+
+        // Pitch and V/UV (all-voiced endpoint) must roundtrip exactly.
+        assert_eq!(b1[0], b[0]);
+        assert_eq!(b1[1], b[1]);
+
+        // Gain may have drifted on the first pass. Iterate once more
+        // (decode b1 → params2, re-encode → b2) — result should be
+        // stable (b2 == b1) since both encoder and decoder now use
+        // quantized γ̃ values on matching states.
+        let mut state_c = DecoderState::new();
+        let params2 = dequantize(&u1, &mut state_c).unwrap();
+        let mut state_d = DecoderState::new();
+        let u2 = quantize(&params2, &mut state_d).unwrap();
+        let b2 = deprioritize(&u2);
+        assert_eq!(b2[2], b1[2], "gain should be stable on iteration 2");
+    }
+
+    #[test]
+    fn dequantize_advances_state_between_frames() {
+        use crate::halfrate::priority::prioritize;
+        let b = [0u16; 9];
+        let u = prioritize(&b);
+        let mut state = DecoderState::new();
+        let g0 = state.previous_gamma();
+        let _ = dequantize(&u, &mut state).unwrap();
+        let g1 = state.previous_gamma();
+        // gamma_0 = Δ̃_γ + 0.5·0 = -2.0, so ≠ 0.
+        assert_ne!(g0, g1);
+        // Run another frame — gamma applies differential recurrence.
+        let _ = dequantize(&u, &mut state).unwrap();
+        let g2 = state.previous_gamma();
+        // g2 = -2.0 + 0.5·g1 = -2.0 + 0.5·(-2.0) = -3.0.
+        assert!((g2 - (-3.0)).abs() < 1e-6);
+    }
+
+    // ---- HOC requantization identity --------------------------------------
+
+    /// Number of `C̃_{i,k}` coefficients block `i` carries, and therefore the
+    /// number of leading Annex R entries [`assemble_hoc_matrix`] reads from the
+    /// row an index selects. Entries past this are never reconstructed, so two
+    /// rows agreeing this far are indistinguishable after decode.
+    fn decoder_visible_hoc_dims(j_i: u8) -> usize {
+        if j_i < 3 {
+            0
+        } else {
+            (j_i.min(6) - 2) as usize
+        }
+    }
+
+    /// Decode → re-encode must return an Annex R row the decoder cannot tell
+    /// apart from the one it started with.
+    ///
+    /// The encoder's HOC search must span exactly the coefficients the decoder
+    /// reconstructs. If it scores the full 4-wide row against a target that was
+    /// zero-filled past `J̃_i − 2`, the absent tail votes: rows whose trailing
+    /// entries sit near zero win on distance the decoder never measures, and the
+    /// search returns a row that differs in a *leading*, reconstructed entry.
+    /// That is an encode-only bias, so it does not cancel on a round trip — it
+    /// shows up as the emitted spectrum disagreeing with the one that was
+    /// decoded, and as a rate-conversion output disagreeing with the reference's.
+    ///
+    /// `L = 13` gives Annex N blocks `[3, 3, 3, 4]`: three blocks carry a single
+    /// HOC coefficient and the fourth carries two, so three resp. two of every
+    /// 4-wide row are unreconstructed and the bias has room to act. The sweep is
+    /// over all 32 rows of the widest codebook (`b̂₅`) so the result cannot turn
+    /// on one lucky entry.
+    #[test]
+    fn hoc_requantization_returns_a_decoder_equivalent_row() {
+        let l = 13u8;
+        let b0 = (0..=PITCH_INDEX_MAX)
+            .find(|&i| decode_pitch(i).is_some_and(|p| p.l == l))
+            .expect("Annex L pairs some pitch index with L = 13");
+        let blocks = AMBE_BLOCK_LENGTHS[(l - 9) as usize];
+        assert_eq!(blocks, [3, 3, 3, 4], "test premise: L = 13 block lengths");
+
+        let mut checked = 0usize;
+        for b5 in 0..AMBE_HOC_B5.len() as u16 {
+            let mut b = [0u16; 9];
+            b[0] = u16::from(b0);
+            b[1] = 0; // codebook row 0 — every band voiced, so no UV rescaling
+            b[2] = 16; // mid-scale gain, well inside Annex O
+            b[5] = b5;
+            let u = prioritize(&b);
+
+            // Decode with a cold state, then re-encode from that same cold
+            // state: the encoder sees exactly the predictor state the decoder
+            // saw, so any disagreement is the quantizer's own.
+            let mut dec = DecoderState::new();
+            let params = dequantize(&u, &mut dec).expect("synthetic frame decodes");
+            assert_eq!(params.harmonic_count(), l);
+            let mut enc = DecoderState::new();
+            let got = deprioritize(&quantize(&params, &mut enc).expect("re-encodes"));
+
+            let books: [&[[f32; 4]]; 4] = [&AMBE_HOC_B5, &AMBE_HOC_B6, &AMBE_HOC_B7, &AMBE_HOC_B8];
+            for i in 0..4 {
+                let dim = decoder_visible_hoc_dims(blocks[i]);
+                let want = &books[i][b[5 + i] as usize][..dim];
+                let have = &books[i][got[5 + i] as usize][..dim];
+                assert_eq!(
+                    have,
+                    want,
+                    "b5={b5}: block {i} re-encoded to index {} whose reconstructed \
+                     coefficients {have:?} differ from index {}'s {want:?}",
+                    got[5 + i],
+                    b[5 + i],
+                );
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, AMBE_HOC_B5.len(), "every b̂₅ row must be exercised");
+    }
+}

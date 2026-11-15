@@ -42,15 +42,26 @@ class LiveError(Exception):
 
 
 class LiveSession:
-    def __init__(self, peer, targets: List[Dict], max_seconds: float, lead_frames: List[bytes], sound: Optional[str]):
-        """targets: [{'tgid', 'name', 'params': CallParams}]"""
+    def __init__(self, peer, targets: List[Dict], max_seconds: float, lead_frames: List[bytes], sound: Optional[str],
+                 lead_pcm: Optional[np.ndarray] = None):
+        """targets: [{'tgid', 'name', 'params': CallParams}]. The alert tone
+        to play first is either already encoded (lead_frames) or int16 audio
+        (lead_pcm) that this session's encoder codes before the speech, so the
+        two are one continuous encode - no switch of encoder state between
+        them, which costs level jumps."""
         self.id = secrets.token_hex(8)
         self.peer = peer
         self.targets = [{**t, 'stream': peer.new_stream_id(), 'refused': None} for t in targets]
         self.max_seconds = max_seconds
         self.sound = sound
         self.started = datetime.now().isoformat(timespec='seconds')
-        self.state = 'tone' if lead_frames else 'live'
+        lead_pcm = None if lead_pcm is None or not len(lead_pcm) else np.asarray(lead_pcm, dtype=np.int16)
+        if lead_pcm is not None:
+            lead_pcm = np.concatenate([lead_pcm, np.zeros((-lead_pcm.size) % FRAME, np.int16)])
+        self._lead_pcm = lead_pcm
+        n_lead = len(lead_frames) + (0 if lead_pcm is None else lead_pcm.size // FRAME)
+        self.lead_count = n_lead                # frames of alert tone (and the gap after it)
+        self.state = 'tone' if n_lead else 'live'
         self.error: Optional[str] = None
         self.underruns = 0
         self.dropped = 0
@@ -59,7 +70,7 @@ class LiveSession:
         self._pcm: deque = deque()            # int16 chunks from the browser
         self._pcm_lock = threading.Lock()
         self._frames: deque = deque([silence_frame()] * LEAD_SILENCE_FRAMES + list(lead_frames))
-        self._lead_left = len(self._frames)
+        self._lead_left = LEAD_SILENCE_FRAMES + n_lead
         self._cond = threading.Condition()
         self._input_done = False               # browser said stop (or vanished)
         self._encoded_all = False
@@ -108,6 +119,16 @@ class LiveSession:
 
     def _encode_loop(self) -> None:
         enc = IMBEEncoder()
+        if self._lead_pcm is not None:
+            for i in range(0, self._lead_pcm.size, FRAME):
+                try:
+                    frame = enc.encode(self._lead_pcm[i:i + FRAME])
+                except VocoderError:
+                    enc = IMBEEncoder()
+                    frame = silence_frame()
+                with self._cond:
+                    self._frames.append(frame)
+                    self._cond.notify_all()
         # mic audio gets the same treatment as recorded pages, block by block:
         # a fixed gain from the first speech heard, capped, then limited
         gain = None
@@ -256,18 +277,27 @@ class LiveTalk:
         self._lock = threading.Lock()
         self._tone_cache: Dict[str, List[bytes]] = {}
 
-    def _lead_frames(self, sound: Optional[str]) -> List[bytes]:
+    def _lead_audio(self, sound: str):
+        """(int16 audio, tone track) of the alert sound plus the gap after it."""
+        audio, tones = self.pager.sounds.render_with_tones(sound)
+        audio = dsp.apply_gain_db(audio, float(self.pager.settings.get('sound_gain_db', 0)))
+        gap = dsp.silence(float(self.pager.settings.get('sound_gap_ms', 400)) / 1000)
+        track = np.concatenate([tones, np.full((gap.size, 2), np.nan)])
+        return dsp.to_pcm16(np.concatenate([audio, gap])), track
+
+    def _lead(self, sound: Optional[str]):
+        """(encoded frames, audio) for the alert sound before the speech. The
+        compiled encoder codes it in the session, continuous with the speech
+        (a few ms a second of tone); the slow pure Python one can't, so its
+        frames are encoded once per sound and cached."""
         if not sound:
-            return []
+            return [], None
+        if getattr(IMBEEncoder, 'native', False):
+            return [], self._lead_audio(sound)[0]
         if sound not in self._tone_cache:
-            audio, tones = self.pager.sounds.render_with_tones(sound)
-            audio = dsp.apply_gain_db(audio, float(self.pager.settings.get('sound_gain_db', 0)))
-            gap = dsp.silence(float(self.pager.settings.get('sound_gap_ms', 400)) / 1000)
-            track = np.concatenate([tones, np.full((gap.size, 2), np.nan)])
-            frames = encode_pcm(dsp.to_pcm16(np.concatenate([audio, gap])), track)
             # encode_pcm pads to a whole superframe; trailing silence is fine here
-            self._tone_cache[sound] = frames
-        return self._tone_cache[sound]
+            self._tone_cache[sound] = encode_pcm(*self._lead_audio(sound))
+        return self._tone_cache[sound], None
 
     def start(self, targets: List[Dict], sound: Optional[str] = None) -> LiveSession:
         """targets: [{'tgid', 'name'}]. Raises LiveError if it can't start."""
@@ -283,11 +313,11 @@ class LiveTalk:
                     raise LiveError(problem)
             if sound and not self.pager.sounds.exists(sound):
                 raise LiveError(f"unknown sound '{sound}'")
-            lead = self._lead_frames(sound)
+            lead_frames, lead_pcm = self._lead(sound)
             max_s = float(self.pager.settings.get('max_call_seconds', 120))
             self.session = LiveSession(self.pager.peer,
                                        [{**t, 'params': self.pager.call_params(t['tgid'])} for t in targets],
-                                       max_s, lead, sound)
+                                       max_s, lead_frames, sound, lead_pcm)
             logger.info(f"Live talk started: TG {', '.join(str(t['tgid']) for t in targets)}")
             return self.session
 

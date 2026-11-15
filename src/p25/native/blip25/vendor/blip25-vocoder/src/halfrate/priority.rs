@@ -1,0 +1,109 @@
+//! Bit prioritization — the layer between the AMBE+2 info vectors
+//! `û_i` and the quantized voice parameters `b̂_l`.
+//!
+//! Per BABA-A §16.7, Tables 15–18. The mapping is fixed (L-independent)
+//! because the half-rate pitch index encodes the `(L, ω₀)` pair via
+//! Annex L rather than occupying variable-width coefficient fields.
+//!
+//! The table is frozen into `src/generated/ambe_bit_priority.rs` — normative
+//! TIA-102 Annex data. Do not hand-edit it; the tests below enforce its
+//! coverage invariants.
+
+use crate::bits::BitMap;
+
+include!("../generated/ambe_bit_priority.rs");
+
+/// Number of half-rate parameters: `b̂₀..b̂₈`.
+pub const PARAM_COUNT: usize = 9;
+
+/// Half-rate parameter widths in bits, indexed by `src_param`.
+/// Source: BABA-A §16.7:
+/// `b̂₀=7, b̂₁=5, b̂₂=5, b̂₃=9, b̂₄=7, b̂₅=5, b̂₆=4, b̂₇=4, b̂₈=3`; sum = 49.
+pub const PARAM_WIDTHS: [u8; PARAM_COUNT] = [7, 5, 5, 9, 7, 5, 4, 4, 3];
+
+/// Half-rate info vector widths. Sum = 49. The spec's §2.3 table lists these
+/// as 12/12/12/13, which contradicts the §16.7 bit map; 12/12/11/14 is what
+/// the map actually covers, so do not "correct" them back to §2.3.
+pub const VECTOR_WIDTHS: [u8; 4] = [12, 12, 11, 14];
+
+/// Prioritize a quantized half-rate parameter array `b̂₀..b̂₈`
+/// into the 4 info vectors `û₀..û₃`.
+pub fn prioritize(b: &[u16; PARAM_COUNT]) -> [u16; 4] {
+    let mut u = [0u16; 4];
+    for m in &AMBE_BIT_MAP {
+        let bit = (b[m.src_param as usize] >> m.src_bit) & 1;
+        u[m.dst_vec as usize] |= bit << m.dst_bit;
+    }
+    u
+}
+
+/// Deprioritize 4 info vectors `û₀..û₃` into a quantized parameter
+/// array `b̂₀..b̂₈`.
+pub fn deprioritize(u: &[u16; 4]) -> [u16; PARAM_COUNT] {
+    let mut b = [0u16; PARAM_COUNT];
+    for m in &AMBE_BIT_MAP {
+        let bit = (u[m.dst_vec as usize] >> m.dst_bit) & 1;
+        b[m.src_param as usize] |= bit << m.src_bit;
+    }
+    b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_b(seed: u32) -> [u16; PARAM_COUNT] {
+        let mut b = [0u16; PARAM_COUNT];
+        let mut state = seed;
+        for i in 0..PARAM_COUNT {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let w = PARAM_WIDTHS[i] as u32;
+            let mask = ((1u32 << w) - 1) as u16;
+            b[i] = (state as u16) & mask;
+        }
+        b
+    }
+
+    #[test]
+    fn roundtrip_sampled() {
+        for seed in [1u32, 0xDEADBEEF, 0xCAFEBABE, 0xA5A5A5A5, 42] {
+            let b = sample_b(seed);
+            let u = prioritize(&b);
+            for (i, &w) in VECTOR_WIDTHS.iter().enumerate() {
+                let mask = (1u16 << w) - 1;
+                assert_eq!(
+                    u[i] & !mask,
+                    0,
+                    "seed 0x{seed:08x}: û{i} has bits beyond width {w}"
+                );
+            }
+            let b2 = deprioritize(&u);
+            assert_eq!(b2, b, "seed 0x{seed:08x}");
+        }
+    }
+
+    #[test]
+    fn zero_prioritizes_to_zero() {
+        let u = prioritize(&[0u16; PARAM_COUNT]);
+        assert_eq!(u, [0u16; 4]);
+    }
+
+    #[test]
+    fn single_bit_propagation() {
+        for m in AMBE_BIT_MAP.iter() {
+            let mut b = [0u16; PARAM_COUNT];
+            b[m.src_param as usize] = 1 << m.src_bit;
+            let u = prioritize(&b);
+            let ones: u32 = u.iter().map(|x| x.count_ones()).sum();
+            assert_eq!(ones, 1);
+            let b2 = deprioritize(&u);
+            assert_eq!(b2, b);
+        }
+    }
+
+    #[test]
+    fn widths_sum_to_49() {
+        assert_eq!(PARAM_WIDTHS.iter().map(|&w| u16::from(w)).sum::<u16>(), 49);
+        assert_eq!(VECTOR_WIDTHS.iter().map(|&w| u16::from(w)).sum::<u16>(), 49);
+    }
+}

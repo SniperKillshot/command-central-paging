@@ -79,7 +79,7 @@ p25:
   sys_id: "001"              # P25 system ID, hex (dvmhost sysId)
   net_id: "BB800"            # P25 WACN, hex (dvmhost netId)
   priority: 4
-  lead_in_ms: 400            # silence before the audio, so radios unmute in time
+  lead_in_ms: 500            # silence before the audio, so radios and repeaters key up and sync in time
   sound_gap_ms: 400          # between the alert sound and the speech
   tail_ms: 300
   voice_gain_db: 0

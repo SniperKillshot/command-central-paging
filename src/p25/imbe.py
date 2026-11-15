@@ -5,9 +5,9 @@ src/vocoder/imbe (originally Pavel Yazev's imbe_vocoder from OP25, built on
 the ETSI/ITU fixed-point basic operators). Every arithmetic step keeps the C
 code's 16/32-bit saturation and wrap-around.
 
-src/p25/native/imbe_enc.c is the same encoder in C (bit-identical output,
-tests/test_imbe_native.py); IMBEEncoder below is that one when it has been
-built (python tools/build_native.py), and PyIMBEEncoder otherwise.
+IMBEEncoder below is the blip25 encoder (src/p25/blip25.py, bit-exact with
+the DVSI reference vocoder) when it has been built with
+python tools/build_native.py, and this one, PyIMBEEncoder, otherwise.
 
 Input: 160 samples (20 ms) of signed 16-bit PCM at 8 kHz per call.
 Output: 11 bytes - the 88-bit IMBE frame (u0..u7, unprotected), the form
@@ -444,7 +444,7 @@ def _best_b0(freqs) -> Optional[int]:
 
 def tone_hint(center):
     """(b0, harmonic numbers) for the known tone frequencies at the centre of
-    the analysis window (NaN = no tone), or None. Shared by both encoders."""
+    the analysis window (NaN = no tone), or None."""
     freqs = tuple(round(float(f), 2) for f in np.asarray(center).ravel() if f == f and f > 0)
     if not freqs:
         return None
@@ -476,6 +476,7 @@ class PyIMBEEncoder:
     """Stateful encoder: feed consecutive 20 ms frames of one call."""
 
     native = False
+    tone_hints = True           # uses the alert tones' tone track
 
     def __init__(self):
         self.prev_pitch = 158
@@ -1396,22 +1397,21 @@ def pack_frame_vector(fv: Sequence[int]) -> bytes:
 
 
 def _choose_encoder():
-    """The compiled encoder (src/p25/native, same output, much faster) if it
-    has been built, else this pure Python one."""
+    """The blip25 encoder (reference-exact, much faster) if it has been
+    built, else this pure Python one."""
     if os.environ.get('CCP_PURE_PYTHON_IMBE', '').strip() not in ('', '0'):
         return PyIMBEEncoder
-    from src.p25 import imbe_native
-    if imbe_native.available():
-        return imbe_native.NativeIMBEEncoder
-    logger.info(f"Using the pure Python IMBE encoder ({imbe_native.load_error()})")
+    from src.p25 import blip25
+    if blip25.available():
+        return blip25.Blip25Encoder
+    logger.info(f"Using the pure Python IMBE encoder ({blip25.load_error()})")
     return PyIMBEEncoder
 
 
 IMBEEncoder = _choose_encoder()
 
 
-# A silent frame, for padding and as a fallback if the encoder ever hits a
-# condition where the C code would abort.
+# A silent frame, for padding and as a fallback if the encoder ever fails.
 _silence_cache: List[bytes] = []
 
 

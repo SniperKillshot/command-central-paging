@@ -2,7 +2,9 @@
 
 Everything is produced at 8 kHz mono float in [-1, 1]. Built-in sounds also
 return a tone track - the frequencies being generated at each sample - so
-the P25 vocoder can code them cleanly (see IMBEEncoder._apply_tone_hint).
+the pure Python P25 encoder can code them cleanly (see
+PyIMBEEncoder._apply_tone_hint). The blip25 encoder needs neither: its tone
+detector finds them in the audio (src/p25/native/blip25/src/lib.rs).
 """
 import logging
 import os
@@ -19,9 +21,12 @@ LEVEL = 0.5   # -6 dBFS: loud, but leaves the vocoder headroom
 
 
 def _snap(*freqs):
-    """Shift tones (by < 0.4%) onto frequencies the P25 vocoder reproduces
-    exactly; tones played together are snapped together."""
-    from src.p25.imbe import codec_tone_frequencies
+    """For the pure Python encoder, shift tones (by < 0.4%) onto frequencies
+    it reproduces exactly; tones played together are snapped together. The
+    blip25 encoder gets the tones as written."""
+    from src.p25.imbe import IMBEEncoder, codec_tone_frequencies
+    if not getattr(IMBEEncoder, 'tone_hints', False):
+        return tuple(float(f) for f in freqs)
     return codec_tone_frequencies(freqs)
 
 

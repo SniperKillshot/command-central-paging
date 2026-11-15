@@ -63,7 +63,7 @@ class P25Pager:
         frequencies of generated alert sounds so the vocoder codes them cleanly;
         it is NaN for silence and speech. audio: recorded speech (8 kHz float)
         used in place of the spoken message."""
-        lead = float(self.settings.get('lead_in_ms', 400)) / 1000
+        lead = float(self.settings.get('lead_in_ms', 500)) / 1000
         gap = float(self.settings.get('sound_gap_ms', 400)) / 1000
         tail = float(self.settings.get('tail_ms', 300)) / 1000
 

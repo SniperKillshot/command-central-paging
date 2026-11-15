@@ -88,9 +88,9 @@ talkgroup, sent from `p25.source_id`:
 
 1. The message is spoken by the selected text-to-speech voice, optionally
    after an alert sound, and levelled for the radio.
-2. The audio is encoded with an IMBE (P25 Phase 1) vocoder - a pure Python
-   port of the fixed-point encoder dvmhost uses, so no compiler or native
-   library is needed.
+2. The audio is encoded with the P25 Phase 1 (IMBE) vocoder: blip25, which is
+   bit-exact with the DVSI reference codec radios use, once built (see
+   below); otherwise a slower pure Python port of dvmhost's encoder.
 3. It goes to the FNE as LDU1/LDU2 voice frames every 180 ms with the link
    control (talkgroup, source ID) Reed-Solomon protected, then a terminator -
    the same packets dvmbridge sends.
@@ -100,8 +100,7 @@ the page is marked failed with that reason. With `require_active_talkgroup`
 (default on) a page to a talkgroup the FNE hasn't listed as active fails
 straight away instead of disappearing.
 
-The encoder runs about 1.3x faster than real time on a desktop PC. On a
-slower host the call starts after a short pre-buffer, sized so the audio
+On a slow host the call starts after a short pre-buffer, sized so the audio
 never stalls once it is on air.
 
 ### Voices
@@ -160,26 +159,62 @@ Other endpoints: `GET /api/destinations`, `GET /api/sounds`,
 `GET|POST /api/tts` (engines, voices, current voice), and
 `POST /api/tts/preview` (WAV of a message as it would be sent).
 
-The IMBE encoder and decoder are ports of GPL-licensed code from dvmhost
-(OP25's imbe_vocoder and mbelib), so this project should be treated as GPL
-if it is ever distributed.
+The pure Python IMBE encoder and decoder are ports of GPL-licensed code from
+dvmhost (OP25's imbe_vocoder and mbelib), so this project should be treated
+as GPL if it is ever distributed. blip25-vocoder is MIT licensed; see its
+PATENT_NOTICE.md (the patent it lists applies to the half-rate codec, which
+this project doesn't use).
 
-### Compiled voice encoder and decoder (recommended)
+### The blip25 vocoder (recommended)
 
-The IMBE encoder and decoder are pure Python by default. The encoder runs at
-only about real time on a fast PC: too slow for live talk on small hardware,
-and pages take a while to start. A compiled version of both (the encoder's
-output identical, the decoder's matching to rounding, each roughly 10-100x
-faster) is used automatically once built:
+[blip25-vocoder](https://github.com/openBLIP25/blip25-vocoder) (MIT) is a
+fixed-point Rust implementation of the P25 vocoder, bit-exact with the DVSI
+reference codec. It replaces both the encoder (pages, live talk) and the
+decoder (listening, previews), and is used automatically once built:
 
-    python tools/build_native.py      # needs a C compiler
-    python tools/bench.py             # shows which encoder is in use and how fast
+    python tools/build_native.py      # needs Rust 1.85+ (cargo)
+    python tools/bench.py             # shows which vocoder is in use and how fast
 
-Compilers: Alpine `apk add build-base`, Debian/Ubuntu `apt install
-build-essential`, Windows Visual Studio or Build Tools with "Desktop
-development with C++". Build it on the machine that runs the service (the
-library is platform-specific and not committed). Set
-`CCP_PURE_PYTHON_IMBE=1` to force the Python versions.
+Rust: Alpine 3.22 or later `apk add cargo`; elsewhere
+[rustup](https://rustup.rs) (on Windows, also Visual Studio or its Build Tools
+with "Desktop development with C++"). The crate is vendored in
+`src/p25/native/blip25/vendor` (with two small patches, see `PATCHES.md`
+there), so the build needs no internet. Build on the machine that runs the service - the library is
+platform-specific and not committed - and rebuild after pulling a change to
+`src/p25/native/blip25`. The build uses only baseline x86-64 instructions,
+so it suits older CPUs such as the Barco CSC-1's AMD G-T65N.
+
+Without it, the pure Python encoder and decoder are used. They work anywhere
+but are not reference-exact and are slow: live talk needs a fast PC, and
+pages take a while to start on small hardware. Set `CCP_PURE_PYTHON_IMBE=1`
+to force them.
+
+**Tones.** IMBE's speech analysis codes a steady tone above about 405 Hz as
+noise or buzz, and upstream blip25 never enables the reference engine's
+in-band tone detector. The vendored copy is patched so it can, and every
+encoder here (pages, live talk) runs the stock encoder and a tone-detecting
+twin side by side, choosing per 20 ms frame: the tone frame when the twin
+flagged a tone, unless the stock frame codes a clean line closer to the
+input's frequency (below ~405 Hz the detector's raster is a few percent
+off). The encoder whose frame wasn't sent takes over the other's state, so
+switching causes no level jumps. Speech encodes exactly as upstream.
+Measured, single tones at -21 dBFS:
+
+| Tones | Stock encoder | Stock + tone detector |
+|---|---|---|
+| 250-404 Hz | -1.2..+1.6%, purity 0.90-1.00 | the same |
+| 500-3300 Hz | -10.6..+16.9%, purity 0.03-0.63 | -2.2..+3.0%, purity 0.71-1.00 |
+
+(frequency error of the decoded line; purity is its share of the energy
+within 5 Hz). Weak spots: about 422 Hz, where the detector alternates
+between two raster lines (+2.8%, purity 0.64), and about 3.2 kHz. The
+built-in alert sounds come through within about 1 dB of their level. Two-tone
+pager formats (Quik-Call II) need accuracy of about 2-3%: check against a
+real pager before relying on it.
+
+Live talk encodes its alert tone and the speech after it with one encoder,
+for the same reason. The pure Python encoder has its own tone handling (it
+shifts generated tones onto its pitch grid) and is not used with blip25.
 
 ## Dispatch console
 
@@ -212,6 +247,80 @@ selection, `L` toggles listening.
 Browsers only allow the microphone on `localhost` or over HTTPS, so live talk
 works on the machine running the service, or elsewhere once it is behind an
 HTTPS reverse proxy. Listening, tones and messages work from anywhere.
+
+### Screen options
+
+Two URL options give a screen a fixed job. Each screen has its own URL, so
+the same service can drive a listen-only touchscreen and a talking PC:
+
+| URL | Effect |
+|---|---|
+| `/dispatch?talk=off` | Listen-only: no talk button, `Space` does nothing, the microphone is never asked for. Tiles, listening, tones and messages work as normal. |
+| `/dispatch?listen=on` | Starts listening when the page loads, ignoring the remembered on/off. Browsers block sound until the screen is first tapped, unless they are started with `--autoplay-policy=no-user-gesture-required` (see the kiosk setup below). |
+
+Use both together: `/dispatch?talk=off&listen=on`.
+
+### Host touchscreen (Alpine kiosk)
+
+To have the machine running the service boot straight into a full-screen,
+listen-only console on its own touchscreen:
+
+```sh
+# as root
+setup-xorg-base
+apk add chromium mesa-dri-gallium xf86-video-ati linux-firmware-radeon \
+        xset unclutter-xfixes font-dejavu alsa-utils alsa-lib
+adduser -D kiosk
+addgroup kiosk audio
+addgroup kiosk video
+addgroup kiosk input
+alsamixer            # unmute the output (M) and set the level, then:
+alsactl store
+```
+
+`xf86-video-ati` and `linux-firmware-radeon` are for the CSC-1's AMD G-T65N
+(Radeon HD 6250); on other hardware use that machine's graphics driver.
+
+Log `kiosk` in automatically on the console: in `/etc/inittab`, replace the
+`tty1::respawn:/sbin/getty 38400 tty1` line with:
+
+```
+tty1::respawn:/bin/login -f kiosk
+```
+
+`/home/kiosk/.profile`:
+
+```sh
+[ "$(tty)" = /dev/tty1 ] && exec startx
+```
+
+`/home/kiosk/.xinitrc`:
+
+```sh
+xset s off -dpms s noblank          # never blank the screen
+unclutter --timeout 1 &             # hide the pointer (it's a touchscreen)
+# wait for the paging service to be up
+until wget -q -O /dev/null http://localhost:5000/health; do sleep 2; done
+exec chromium-browser --kiosk --noerrdialogs --disable-infobars --no-first-run \
+    --autoplay-policy=no-user-gesture-required \
+    --disable-pinch --overscroll-history-navigation=0 \
+    --check-for-update-interval=31536000 \
+    'http://localhost:5000/dispatch?talk=off&listen=on'
+```
+
+Then `reboot`. The paging service has to start at boot as well. Notes:
+
+- **Exiting the kiosk:** use `Ctrl+Alt+F2` for a text login, or
+  `Alt+F4` to close Chromium, which drops back to the login.
+- **API token:** if `web.api_token` is set, the console asks for it the
+  first time a tone or message is sent, and the browser remembers it.
+- **Spoken messages:** these need text typed in, so plug in a keyboard. Alert
+  tones and listening need only touch.
+- **Touch lands in the wrong place:** if the screen is rotated or scaled, set
+  the touchscreen's `Coordinate Transformation Matrix` with `xinput` in
+  `.xinitrc`.
+- **No sound:** check `aplay -l` lists the output and that it is unmuted in
+  `alsamixer`. When PulseAudio isn't running, Chromium falls back to ALSA.
 
 ## Local development
 

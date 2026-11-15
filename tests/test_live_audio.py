@@ -158,7 +158,8 @@ class LiveTalkTests(unittest.TestCase):
         self.assertEqual(s.state, 'tone')
         self.talk(s, speechlike(0.5))
         ldus = [p for seq, p in self.packets(s.targets[0]['stream']) if seq != dvm.END_OF_CALL_SEQ]
-        tone_frames = len(self.live._tone_cache['triple_beep'])
+        tone_frames = s.lead_count
+        self.assertGreater(tone_frames, 0)
         self.assertGreaterEqual(len(ldus) * 9, 9 + tone_frames)
         self.assertEqual(s.status()['state'], 'ended')
 

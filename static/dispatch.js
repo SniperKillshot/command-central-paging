@@ -638,8 +638,14 @@ async function openMic() {
         const out = talk.resampler.process(data);
         if (out.length) talk.pending.push(out);
     };
+    // The node only runs while connected to the output, and browsers don't all
+    // output silence from it (some pass the mic through: the talker hears
+    // themselves), so it goes out through a muted gain.
+    const mute = ctx.createGain();
+    mute.gain.value = 0;
     source.connect(node);
-    node.connect(ctx.destination);   // outputs silence; needed for the node to run
+    node.connect(mute);
+    mute.connect(ctx.destination);
     talk.mic = { ctx, stream, node };
     return talk.mic;
 }
